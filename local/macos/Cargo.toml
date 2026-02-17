@@ -1,0 +1,16 @@
+[package]
+name = "notes"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+objc2 = { version = ">=0.1", features = ["exception"] }
+objc2-foundation = { version = ">=0.1", features = ["NSException", "NSTimer"] }
+objc2-app-kit = ">=0.1"
+
+# AWS S3 presign + upload
+aws-config = "1.8"
+aws-sdk-s3 = "1.8"
+tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
+reqwest = { version = "0.11", features = ["blocking", "rustls-tls"] }
+chrono = { version = "0.4", features = ["alloc"] }
