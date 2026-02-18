@@ -14,7 +14,10 @@ use objc2_app_kit::{
     NSWindowDelegate, NSWindowStyleMask, NSSavePanel, NSMenu, NSMenuItem,
     NSEventModifierFlags, NSPanel, NSButton, NSBezelStyle, NSTableView, NSTableColumn,
     NSSearchField, NSTableViewDelegate, NSTableViewDataSource, NSSearchFieldDelegate,
-    NSControlTextEditingDelegate, NSTextFieldDelegate,
+    NSControlTextEditingDelegate, NSTextFieldDelegate, NSControl,
+};
+use objc2_authentication_services::{
+    ASAuthorizationAppleIDButton, ASAuthorizationAppleIDButtonStyle, ASAuthorizationAppleIDButtonType,
 };
 use objc2_foundation::{
     ns_string, MainThreadMarker, NSNotification, NSObject, NSObjectProtocol, NSPoint, NSRect,
@@ -1010,6 +1013,76 @@ impl RemoteFilePicker {
     }
 }
 
+/// Shows a sign-in window with "Sign in with Apple" button.
+/// Returns true if user clicked sign in, false if cancelled/closed.
+fn show_sign_in_window(mtm: MainThreadMarker) -> bool {
+    use objc2_app_kit::NSView;
+    
+    // Activate app first so modal window can be shown
+    let app = NSApplication::sharedApplication(mtm);
+    app.setActivationPolicy(NSApplicationActivationPolicy::Regular);
+    #[allow(deprecated)]
+    app.activateIgnoringOtherApps(true);
+    
+    // Create the panel
+    let panel_rect = NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(400.0, 300.0));
+    let panel = unsafe {
+        let p = NSPanel::initWithContentRect_styleMask_backing_defer(
+            NSPanel::alloc(mtm),
+            panel_rect,
+            NSWindowStyleMask::Titled | NSWindowStyleMask::Closable,
+            NSBackingStoreType::Buffered,
+            false,
+        );
+        p.setReleasedWhenClosed(false);
+        p
+    };
+    panel.setTitle(ns_string!("Sign In"));
+    panel.center();
+    
+    let content_view = panel.contentView().expect("panel must have content view");
+    
+    // Create Sign in with Apple button (centered)
+    let button = unsafe {
+        ASAuthorizationAppleIDButton::buttonWithType_style(
+            ASAuthorizationAppleIDButtonType::SignIn,
+            ASAuthorizationAppleIDButtonStyle::Black,
+            mtm,
+        )
+    };
+    
+    // Set button frame (centered in window, Apple recommends min 140x30)
+    let button_width = 250.0;
+    let button_height = 44.0;
+    let button_x = (400.0 - button_width) / 2.0;
+    let button_y = (300.0 - button_height) / 2.0;
+    let button_frame = NSRect::new(
+        NSPoint::new(button_x, button_y),
+        NSSize::new(button_width, button_height),
+    );
+    
+    // Cast button to NSView and set frame
+    let button_as_view: &NSView = unsafe { &*((&*button) as *const _ as *const NSView) };
+    button_as_view.setFrame(button_frame);
+    content_view.addSubview(button_as_view);
+    
+    // Set action to stopModal via NSControl
+    let button_as_control: &NSControl = unsafe { &*((&*button) as *const _ as *const NSControl) };
+    unsafe {
+        button_as_control.setAction(Some(sel!(stopModal)));
+        button_as_control.setTarget(Some(&*app));
+    }
+    
+    // Run modal
+    let response = app.runModalForWindow(&panel);
+    
+    // NSModalResponseStop (0) means stopModal was called (button clicked)
+    panel.orderOut(None);
+    
+    // If the response indicates the modal was stopped (not aborted), user clicked sign in
+    response == objc2_app_kit::NSModalResponseStop
+}
+
 struct AppDelegateIvars {
     is_terminating: Mutex<bool>,
     s3_client: OnceCell<S3Client>,
@@ -1057,6 +1130,14 @@ define_class!(
         #[unsafe(method(applicationDidFinishLaunching:))]
         fn did_finish_launching(&self, notification: &NSNotification) {
             let mtm = self.mtm();
+
+            // Check if AWS credentials are configured
+            if std::env::var("AWS_ACCESS_KEY_ID").is_err() {
+                // Show sign-in window first
+                let signed_in = show_sign_in_window(mtm);
+                println!("Sign in result: {}", signed_in);
+                // For now, continue regardless of result (placeholder)
+            }
 
             // Initialize S3 client if S3_BUCKET is configured
             if std::env::var("S3_BUCKET").is_ok() {

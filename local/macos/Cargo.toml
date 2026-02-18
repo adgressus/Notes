@@ -7,6 +7,7 @@ edition = "2021"
 objc2 = { version = ">=0.1", features = ["exception"] }
 objc2-foundation = { version = ">=0.1", features = ["NSException", "NSTimer"] }
 objc2-app-kit = ">=0.1"
+objc2-authentication-services = { version = ">=0.1", features = ["ASAuthorizationAppleIDButton"] }
 
 # AWS S3 presign + upload
 aws-config = "1.8"
