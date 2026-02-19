@@ -16,6 +16,8 @@ use windows::{
     },
 };
 
+mod microsoft_auth;
+
 static mut EDIT_HWND: HWND = HWND(std::ptr::null_mut());
 static mut MAIN_HWND: HWND = HWND(std::ptr::null_mut());
 static mut INITIAL_CONTENT: Option<String> = None;
@@ -170,6 +172,23 @@ fn main() -> Result<()> {
     println!("[Main] AWS_ACCESS_KEY_ID env var: '{}'", 
         std::env::var("AWS_ACCESS_KEY_ID").map(|s| format!("{}...", &s[..4.min(s.len())])).unwrap_or_default());
     
+    // If AWS credentials are not set, show login dialog
+    let aws_key = std::env::var("AWS_ACCESS_KEY_ID").unwrap_or_default();
+    if aws_key.is_empty() {
+        println!("[Main] AWS_ACCESS_KEY_ID not set, showing login dialog");
+        unsafe {
+            let template = build_login_dialog_template();
+            let instance = GetModuleHandleW(None).unwrap_or_default();
+            DialogBoxIndirectParamW(
+                instance,
+                template.as_ptr() as *const windows::Win32::UI::WindowsAndMessaging::DLGTEMPLATE,
+                None,
+                Some(login_dlg_proc),
+                LPARAM(0),
+            );
+        }
+    }
+
     // Fetch content from S3 in a blocking manner before starting the GUI
     if !bucket.is_empty() {
         println!("[Main] Creating Tokio runtime...");
@@ -662,6 +681,10 @@ const IDC_FILE_LIST: i32 = 101;
 const IDC_OK: i32 = 1;
 const IDC_CANCEL: i32 = 2;
 
+// Dialog control IDs for the login dialog
+const IDC_LOGIN_BTN: i32 = 201;
+const IDC_LOGIN_CANCEL: i32 = 202;
+
 static mut PICKER_KEYS: Option<Vec<String>> = None;
 static mut PICKER_SELECTED: Option<String> = None;
 
@@ -805,6 +828,223 @@ fn build_picker_dialog_template() -> Vec<u16> {
     buf.push(0); // creation data length
 
     buf
+}
+
+/// Builds an in-memory DLGTEMPLATE for the login dialog
+fn build_login_dialog_template() -> Vec<u16> {
+    let mut buf: Vec<u16> = Vec::new();
+
+    fn align4(buf: &mut Vec<u16>) {
+        while (buf.len() * 2) % 4 != 0 {
+            buf.push(0);
+        }
+    }
+
+    // DLGTEMPLATE
+    let style: u32 = (WS_POPUP.0 | WS_CAPTION.0 | WS_SYSMENU.0 | WS_VISIBLE.0)
+        | DS_MODALFRAME as u32
+        | DS_SETFONT as u32;
+    buf.push(style as u16);
+    buf.push((style >> 16) as u16);
+    buf.push(0); buf.push(0); // dwExtendedStyle low, high
+    buf.push(3); // cdit - number of controls (static text, login button, cancel button)
+    buf.push(80);  // x
+    buf.push(80);  // y
+    buf.push(220); // cx
+    buf.push(90);  // cy
+    buf.push(0);   // menu (none)
+    buf.push(0);   // class (default)
+    // title: "Login Required"
+    for c in "Login Required".encode_utf16() { buf.push(c); }
+    buf.push(0);
+    // Font (DS_SETFONT): size then name
+    buf.push(9);
+    for c in "Segoe UI".encode_utf16() { buf.push(c); }
+    buf.push(0);
+
+    // --- Control 1: Static text label ---
+    align4(&mut buf);
+    let st_style: u32 = WS_CHILD.0 | WS_VISIBLE.0;
+    buf.push(st_style as u16);
+    buf.push((st_style >> 16) as u16);
+    buf.push(0); buf.push(0); // dwExtendedStyle
+    buf.push(10);  // x
+    buf.push(10);  // y
+    buf.push(200); // cx
+    buf.push(20);  // cy
+    buf.push(0xFFFF_u16); // id (not used)
+    // class: 0x0082 = static
+    buf.push(0xFFFF);
+    buf.push(0x0082);
+    for c in "AWS credentials not found. Please log in.".encode_utf16() { buf.push(c); }
+    buf.push(0);
+    buf.push(0); // creation data length
+
+    // --- Control 2: Sign in with Microsoft button (owner-drawn) ---
+    align4(&mut buf);
+    let btn_style: u32 = WS_CHILD.0 | WS_VISIBLE.0 | WS_TABSTOP.0 | BS_OWNERDRAW as u32;
+    buf.push(btn_style as u16);
+    buf.push((btn_style >> 16) as u16);
+    buf.push(0); buf.push(0); // dwExtendedStyle
+    buf.push(35);  // x
+    buf.push(40);  // y
+    buf.push(150); // cx (~262px wide)
+    buf.push(20);  // cy (~37px tall)
+    buf.push(IDC_LOGIN_BTN as u16); // id
+    buf.push(0xFFFF);
+    buf.push(0x0080); // button class
+    buf.push(0); // title (empty - we draw it ourselves)
+    buf.push(0); // creation data length
+
+    // --- Control 3: Cancel button ---
+    align4(&mut buf);
+    let btn_style2: u32 = WS_CHILD.0 | WS_VISIBLE.0 | WS_TABSTOP.0 | BS_PUSHBUTTON as u32;
+    buf.push(btn_style2 as u16);
+    buf.push((btn_style2 >> 16) as u16);
+    buf.push(0); buf.push(0); // dwExtendedStyle
+    buf.push(85);  // x
+    buf.push(68);  // y
+    buf.push(50);  // cx
+    buf.push(14);  // cy
+    buf.push(IDC_LOGIN_CANCEL as u16); // id
+    buf.push(0xFFFF);
+    buf.push(0x0080); // button class
+    for c in "Cancel".encode_utf16() { buf.push(c); }
+    buf.push(0);
+    buf.push(0); // creation data length
+
+    buf
+}
+
+/// Draws the official Microsoft branded "Sign in with Microsoft" button
+unsafe fn draw_microsoft_sign_in_button(dis: &windows::Win32::UI::Controls::DRAWITEMSTRUCT) {
+    let hdc = dis.hDC;
+    let rc = dis.rcItem;
+
+    // Background: white
+    let bg_brush = CreateSolidBrush(COLORREF(0x00FFFFFF)); // white
+    FillRect(hdc, &rc, bg_brush);
+    let _ = DeleteObject(bg_brush);
+
+    // Border: #8C8C8C
+    let border_pen = CreatePen(PS_SOLID, 1, COLORREF(0x008C8C8C));
+    let old_pen = SelectObject(hdc, border_pen);
+    let old_brush = SelectObject(hdc, GetStockObject(NULL_BRUSH));
+    Rectangle(hdc, rc.left, rc.top, rc.right, rc.bottom);
+    SelectObject(hdc, old_brush);
+    SelectObject(hdc, old_pen);
+    let _ = DeleteObject(border_pen);
+
+    // Microsoft logo - 4 colored squares, positioned vertically centered
+    let logo_size = 4; // each square is 4x4 pixels
+    let logo_gap = 1;  // 1px gap between squares
+    let logo_total = logo_size * 2 + logo_gap; // 9px total
+    let logo_x = rc.left + 12;
+    let logo_y = rc.top + (rc.bottom - rc.top - logo_total) / 2;
+
+    // Top-left: Red (#F25022)
+    let red_brush = CreateSolidBrush(COLORREF(0x002250F2));
+    let red_rc = RECT { left: logo_x, top: logo_y, right: logo_x + logo_size, bottom: logo_y + logo_size };
+    FillRect(hdc, &red_rc, red_brush);
+    let _ = DeleteObject(red_brush);
+
+    // Top-right: Green (#7FBA00)
+    let green_brush = CreateSolidBrush(COLORREF(0x0000BA7F));
+    let green_rc = RECT { left: logo_x + logo_size + logo_gap, top: logo_y, right: logo_x + logo_total, bottom: logo_y + logo_size };
+    FillRect(hdc, &green_rc, green_brush);
+    let _ = DeleteObject(green_brush);
+
+    // Bottom-left: Blue (#00A4EF)
+    let blue_brush = CreateSolidBrush(COLORREF(0x00EFA400));
+    let blue_rc = RECT { left: logo_x, top: logo_y + logo_size + logo_gap, right: logo_x + logo_size, bottom: logo_y + logo_total };
+    FillRect(hdc, &blue_rc, blue_brush);
+    let _ = DeleteObject(blue_brush);
+
+    // Bottom-right: Yellow (#FFB900)
+    let yellow_brush = CreateSolidBrush(COLORREF(0x0000B9FF));
+    let yellow_rc = RECT { left: logo_x + logo_size + logo_gap, top: logo_y + logo_size + logo_gap, right: logo_x + logo_total, bottom: logo_y + logo_total };
+    FillRect(hdc, &yellow_rc, yellow_brush);
+    let _ = DeleteObject(yellow_brush);
+
+    // Text: "Sign in with Microsoft" in #5E5E5E, Segoe UI Semibold
+    let font = CreateFontW(
+        -15, 0, 0, 0,
+        FW_SEMIBOLD.0 as i32,
+        0, 0, 0,
+        DEFAULT_CHARSET.0 as u32,
+        OUT_DEFAULT_PRECIS.0 as u32,
+        CLIP_DEFAULT_PRECIS.0 as u32,
+        CLEARTYPE_QUALITY.0 as u32,
+        (FF_DONTCARE.0 | DEFAULT_PITCH.0) as u32,
+        w!("Segoe UI"),
+    );
+    let old_font = SelectObject(hdc, font);
+    SetBkMode(hdc, TRANSPARENT);
+    SetTextColor(hdc, COLORREF(0x005E5E5E));
+
+    let text_str = "Sign in with Microsoft";
+    let mut text_wide: Vec<u16> = text_str.encode_utf16().collect();
+    let mut text_rc = RECT {
+        left: logo_x + logo_total + 10,
+        top: rc.top,
+        right: rc.right - 8,
+        bottom: rc.bottom,
+    };
+    DrawTextW(hdc, &mut text_wide, &mut text_rc, DT_SINGLELINE | DT_VCENTER);
+
+    SelectObject(hdc, old_font);
+    let _ = DeleteObject(font);
+}
+
+/// Dialog procedure for the login dialog
+unsafe extern "system" fn login_dlg_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> isize {
+    match msg {
+        WM_INITDIALOG => {
+            1 // TRUE - let system set focus
+        }
+        WM_DRAWITEM => {
+            let dis = &*(lparam.0 as *const windows::Win32::UI::Controls::DRAWITEMSTRUCT);
+            if dis.CtlID == IDC_LOGIN_BTN as u32 {
+                draw_microsoft_sign_in_button(dis);
+                return 1; // TRUE - we handled it
+            }
+            0
+        }
+        WM_COMMAND => {
+            let control_id = (wparam.0 & 0xFFFF) as i32;
+            if control_id == IDC_LOGIN_BTN {
+                println!("[Login] Sign in with Microsoft clicked, starting OAuth2 flow...");
+                let rt = tokio::runtime::Runtime::new().expect("Failed to create Tokio runtime");
+                match rt.block_on(microsoft_auth::login_with_microsoft()) {
+                    Ok(token_response) => {
+                        println!("[Login] Successfully authenticated!");
+                        println!("[Login] Access token: {}...", &token_response.access_token[..20.min(token_response.access_token.len())]);
+                        if let Some(ref id_token) = token_response.id_token {
+                            println!("[Login] ID token received ({} chars)", id_token.len());
+                        }
+                        let _ = EndDialog(hwnd, 1);
+                    }
+                    Err(e) => {
+                        eprintln!("[Login] Authentication failed: {}", e);
+                        let msg = format!("Authentication failed:\n{}\0", e);
+                        let msg_wide: Vec<u16> = msg.encode_utf16().collect();
+                        MessageBoxW(hwnd, PCWSTR(msg_wide.as_ptr()), w!("Login Error"), MB_OK | MB_ICONERROR);
+                    }
+                }
+                0
+            } else if control_id == IDC_LOGIN_CANCEL {
+                let _ = EndDialog(hwnd, 0);
+                1
+            } else {
+                0
+            }
+        }
+        WM_CLOSE => {
+            let _ = EndDialog(hwnd, 0);
+            1
+        }
+        _ => 0,
+    }
 }
 
 /// Shows the S3 file picker dialog and opens the selected file in a new window
