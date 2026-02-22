@@ -1,0 +1,32 @@
+{
+	"version": "2.0.0",
+	"tasks": [
+		{
+			"type": "func",
+			"label": "func: host start",
+			"command": "host start",
+			"problemMatcher": "$func-watch",
+			"isBackground": true,
+			"options": {
+				"cwd": "${workspaceFolder}/cloud/functions/get_nonce"
+			}
+		},
+		{
+			"type": "func",
+			"label": "func: publish get-nonce",
+			"command": "azure functionapp publish get-nonce",
+			"options": {
+				"cwd": "${workspaceFolder}/cloud/functions/get_nonce"
+			}
+		},
+		{
+			"type": "cargo",
+			"command": "build",
+			"problemMatcher": [
+				"$rustc"
+			],
+			"group": "build",
+			"label": "rust: cargo build"
+		}
+	]
+}
