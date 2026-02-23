@@ -42,7 +42,7 @@ fn generate_code_challenge(verifier: &str) -> String {
 /// 2. Opens the system browser to Microsoft's authorize endpoint
 /// 3. Waits for the redirect with the authorization code
 /// 4. Exchanges the code for tokens
-pub async fn login_with_microsoft() -> Result<TokenResponse, Box<dyn std::error::Error>> {
+pub async fn login_with_microsoft(nonce: &str) -> Result<TokenResponse, Box<dyn std::error::Error>> {
     //App name: public-microsoft-user-accounts-interface_notes
     let client_id = "397dc399-b9a1-4e0f-90e2-eb3a6a83147b";
 
@@ -59,12 +59,13 @@ pub async fn login_with_microsoft() -> Result<TokenResponse, Box<dyn std::error:
     // Build the authorization URL
     let auth_url = format!(
         "{}?client_id={}&response_type=code&redirect_uri={}&response_mode=query\
-         &scope={}&code_challenge={}&code_challenge_method=S256",
+         &scope={}&code_challenge={}&code_challenge_method=S256&nonce={}",
         AUTHORIZE_URL,
         percent_encode(&client_id),
         percent_encode(&redirect_uri),
         percent_encode(DEFAULT_SCOPES),
         percent_encode(&code_challenge),
+        percent_encode(nonce),
     );
 
     println!("[Auth] Opening browser for Microsoft login...");

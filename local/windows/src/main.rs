@@ -1013,9 +1013,29 @@ unsafe extern "system" fn login_dlg_proc(hwnd: HWND, msg: u32, wparam: WPARAM, l
         WM_COMMAND => {
             let control_id = (wparam.0 & 0xFFFF) as i32;
             if control_id == IDC_LOGIN_BTN {
-                println!("[Login] Sign in with Microsoft clicked, starting OAuth2 flow...");
+                println!("[Login] Sign in with Microsoft clicked, fetching nonce...");
                 let rt = tokio::runtime::Runtime::new().expect("Failed to create Tokio runtime");
-                match rt.block_on(microsoft_auth::login_with_microsoft()) {
+                
+                // Fetch nonce from Azure Function
+                let nonce = match rt.block_on(async {
+                    let resp = reqwest::get("https://notes-auth-func.azurewebsites.net/api/get_nonce").await?;
+                    resp.text().await
+                }) {
+                    Ok(n) => {
+                        println!("[Login] Received nonce: {}", n);
+                        n
+                    }
+                    Err(e) => {
+                        eprintln!("[Login] Failed to fetch nonce: {}", e);
+                        let msg = format!("Failed to fetch nonce:\n{}\0", e);
+                        let msg_wide: Vec<u16> = msg.encode_utf16().collect();
+                        MessageBoxW(hwnd, PCWSTR(msg_wide.as_ptr()), w!("Login Error"), MB_OK | MB_ICONERROR);
+                        return 0;
+                    }
+                };
+                
+                println!("[Login] Starting OAuth2 flow with nonce...");
+                match rt.block_on(microsoft_auth::login_with_microsoft(&nonce)) {
                     Ok(token_response) => {
                         println!("[Login] Successfully authenticated!");
                         println!("[Login] Access token: {}...", &token_response.access_token[..20.min(token_response.access_token.len())]);
