@@ -20,6 +20,12 @@ var logAnalyticsName = '${baseName}-auth-logs'
 var appInsightsName = '${baseName}-auth-insights'
 var deploymentContainerName = 'deployments'
 
+@description('Azure AD tenant ID for JWT validation')
+param azureTenantId string
+
+@description('Azure AD client ID (app registration) for JWT validation')
+param azureClientId string
+
 // ─── Resource Group ──────────────────────────────────────────
 
 resource rg 'Microsoft.Resources/resourceGroups@2024-03-01' = {
@@ -40,6 +46,8 @@ module resources 'resources.bicep' = {
     logAnalyticsName: logAnalyticsName
     appInsightsName: appInsightsName
     deploymentContainerName: deploymentContainerName
+    azureTenantId: azureTenantId
+    azureClientId: azureClientId
   }
 }
 

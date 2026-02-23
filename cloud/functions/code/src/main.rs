@@ -1,12 +1,13 @@
 use std::env;
 use std::io::{BufRead, BufReader, Write};
 use std::net::TcpListener;
-use std::sync::{Mutex};
+use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
+use jsonwebtoken::{decode, decode_header, Algorithm, DecodingKey, Validation};
 use log::{info, warn, error, LevelFilter, Log, Metadata, Record};
-
 use rand::RngExt;
+use serde::Deserialize;
 
 struct CachedToken {
     token: String,
@@ -15,6 +16,30 @@ struct CachedToken {
 }
 
 static TOKEN_CACHE: Mutex<Option<CachedToken>> = Mutex::new(None);
+static JWKS_CACHE: Mutex<Option<CachedJwks>> = Mutex::new(None);
+
+#[derive(Deserialize)]
+struct Claims {
+    nonce: Option<String>,
+    sub: Option<String>,
+}
+
+#[derive(Clone, Deserialize)]
+struct Jwk {
+    kid: String,
+    n: String,
+    e: String,
+}
+
+#[derive(Clone, Deserialize)]
+struct JwksResponse {
+    keys: Vec<Jwk>,
+}
+
+struct CachedJwks {
+    keys: Vec<Jwk>,
+    fetched_at: Instant,
+}
 
 struct ConsoleLogger;
 
@@ -116,7 +141,6 @@ fn get_fresh_token() -> Option<CachedToken> {
                 .output()
                 .ok()?;
             if !output.status.success() {
-                //track(&format!("az cli failed: {}", String::from_utf8_lossy(&output.stderr)), SEV_ERROR);
                 return None;
             }
             String::from_utf8(output.stdout).ok()?
@@ -179,6 +203,120 @@ fn store_nonce(nonce: &str) {
 }
 
 
+/// Fetch Microsoft's JWKS signing keys, cached for 1 hour.
+fn get_jwks(tenant_id: &str) -> Option<Vec<Jwk>> {
+    // Check cache (refresh every hour)
+    {
+        let cache = JWKS_CACHE.lock().ok()?;
+        if let Some(cached) = cache.as_ref() {
+            if cached.fetched_at.elapsed().as_secs() < 3600 {
+                return Some(cached.keys.clone());
+            }
+        }
+    }
+
+    let url = format!(
+        "https://login.microsoftonline.com/{}/discovery/v2.0/keys",
+        tenant_id
+    );
+    info!("Fetching JWKS from {url}");
+
+    let resp = ureq::get(&url).call().ok()?;
+    let body = resp.into_body().read_to_string().ok()?;
+    let jwks: JwksResponse = serde_json::from_str(&body).ok()?;
+
+    if let Ok(mut cache) = JWKS_CACHE.lock() {
+        *cache = Some(CachedJwks {
+            keys: jwks.keys.clone(),
+            fetched_at: Instant::now(),
+        });
+    }
+
+    Some(jwks.keys)
+}
+
+/// Validate a JWT from Microsoft Entra ID.
+/// Returns the claims if valid, or an error message.
+fn validate_jwt(jwt: &str) -> Result<Claims, String> {
+    let tenant_id = env::var("AZURE_TENANT_ID")
+        .map_err(|_| "AZURE_TENANT_ID not set".to_string())?;
+    let client_id = env::var("AZURE_CLIENT_ID")
+        .map_err(|_| "AZURE_CLIENT_ID not set".to_string())?;
+
+    // Decode header to find which key was used
+    let header = decode_header(jwt)
+        .map_err(|e| format!("Invalid JWT header: {e}"))?;
+    let kid = header.kid
+        .ok_or_else(|| "JWT missing kid in header".to_string())?;
+
+    // Fetch JWKS and find matching key
+    let keys = get_jwks(&tenant_id)
+        .ok_or_else(|| "Failed to fetch JWKS".to_string())?;
+    let jwk = keys.iter().find(|k| k.kid == kid)
+        .ok_or_else(|| format!("No matching key for kid: {kid}"))?;
+
+    let decoding_key = DecodingKey::from_rsa_components(&jwk.n, &jwk.e)
+        .map_err(|e| format!("Invalid RSA key: {e}"))?;
+
+    let mut validation = Validation::new(Algorithm::RS256);
+    validation.set_audience(&[&client_id]);
+    validation.set_issuer(&[
+        format!("https://login.microsoftonline.com/{}/v2.0", tenant_id)
+    ]);
+
+    let token_data = decode::<Claims>(jwt, &decoding_key, &validation)
+        .map_err(|e| format!("JWT validation failed: {e}"))?;
+
+    Ok(token_data.claims)
+}
+
+fn get_nonce() -> (&'static str, String) {
+    let nonce = generate_nonce();
+    store_nonce(&nonce);
+    ("200 OK", nonce)
+}
+
+fn get_token(jwt: &str) -> (&'static str, String) {
+    info!("get_token called, JWT length: {}", jwt.len());
+
+    let jwt = jwt.trim();
+    if jwt.is_empty() {
+        warn!("get_token: empty body");
+        return ("400 Bad Request", "missing token".to_string());
+    }
+
+    // Validate the JWT signature and claims
+    let claims = match validate_jwt(jwt) {
+        Ok(c) => c,
+        Err(e) => {
+            warn!("JWT validation failed: {e}");
+            return ("401 Unauthorized", "unauthorized".to_string());
+        }
+    };
+
+    let nonce = match claims.nonce {
+        Some(n) => n,
+        None => {
+            warn!("JWT missing nonce claim");
+            return ("400 Bad Request", "bad request".to_string());
+        }
+    };
+
+    // TODO: validate nonce against table storage
+    info!("Token requested with nonce: {nonce}, sub: {:?}", claims.sub);
+
+    match get_access_token() {
+        Some(token) => {
+            info!("Storage token acquired successfully");
+            ("200 OK", token)
+        }
+        None => {
+            error!("Failed to acquire access token");
+            ("500 Internal Server Error", "internal error".to_string())
+        }
+    }
+}
+
 fn main() {
     log::set_logger(&LOGGER).unwrap();
     log::set_max_level(LevelFilter::Info);
@@ -198,19 +336,48 @@ fn main() {
             Err(_) => continue,
         };
 
-        let reader = BufReader::new(&stream);
-        let request_line = match reader.lines().next() {
-            Some(Ok(line)) => line,
-            _ => continue,
+        let mut reader = BufReader::new(&stream);
+        let mut request_line = String::new();
+        if reader.read_line(&mut request_line).is_err() {
+            continue;
+        }
+
+        // Parse headers to get Content-Length
+        let mut content_length: usize = 0;
+        loop {
+            let mut header = String::new();
+            if reader.read_line(&mut header).is_err() || header.trim().is_empty() {
+                break;
+            }
+            if let Some(val) = header.strip_prefix("Content-Length: ") {
+                content_length = val.trim().parse().unwrap_or(0);
+            }
+        }
+
+        // Read body if present
+        let req_body = if content_length > 0 {
+            let mut buf = vec![0u8; content_length];
+            use std::io::Read;
+            reader.read_exact(&mut buf).ok();
+            String::from_utf8(buf).unwrap_or_default()
+        } else {
+            String::new()
         };
 
+        info!("Request: {}", request_line.trim());
+        if content_length > 0 {
+            info!("Body ({content_length} bytes): {req_body}");
+        }
+
         let (status, body) = if request_line.starts_with("GET /api/get_nonce") {
-            let nonce = generate_nonce();
-            store_nonce(&nonce);
-            ("200 OK", nonce)
+            get_nonce()
+        } else if request_line.starts_with("POST /api/get_token") {
+            get_token(&req_body)
         } else {
             ("404 Not Found", "not found".to_string())
         };
+
+        info!("Response: {status}");
 
         let response = format!(
             "HTTP/1.1 {status}\r\n\

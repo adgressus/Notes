@@ -7,6 +7,12 @@
     },
     "baseName": {
       "value": "notes"
+    },
+    "azureTenantId": {
+      "value": "72f988bf-86f1-41af-91ab-2d7cd011db47"
+    },
+    "azureClientId": {
+      "value": "397dc399-b9a1-4e0f-90e2-eb3a6a83147b"
     }
   }
 }
