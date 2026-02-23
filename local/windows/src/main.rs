@@ -1042,6 +1042,28 @@ unsafe extern "system" fn login_dlg_proc(hwnd: HWND, msg: u32, wparam: WPARAM, l
                         if let Some(ref id_token) = token_response.id_token {
                             println!("[Login] ID token received ({} chars)", id_token.len());
                         }
+
+                        // Send the id_token to the backend to exchange for AWS credentials
+                        let post_token = token_response.id_token.as_deref()
+                            .unwrap_or(&token_response.access_token);
+                        println!("[Login] Sending token to get_token endpoint...");
+                        match rt.block_on(async {
+                            let client = reqwest::Client::new();
+                            let resp = client
+                                .post("https://notes-auth-func.azurewebsites.net/api/get_token")
+                                .body(post_token.to_string())
+                                .send()
+                                .await?;
+                            resp.text().await
+                        }) {
+                            Ok(response_text) => {
+                                println!("[Login] get_token response: {}", response_text);
+                            }
+                            Err(e) => {
+                                eprintln!("[Login] Failed to send token to get_token: {}", e);
+                            }
+                        }
+
                         let _ = EndDialog(hwnd, 1);
                     }
                     Err(e) => {
