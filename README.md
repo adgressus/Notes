@@ -1,4 +1,10 @@
 
+
+### Clouds
+* Azure
+* (planned) GCP
+* (planned) AWS
+
 ### Functions
 * get_nonce
 * get_token
