@@ -54,6 +54,21 @@ resource noncesTable 'Microsoft.Storage/storageAccounts/tableServices/tables@202
   name: 'nonces'
 }
 
+resource linkingCodesTable 'Microsoft.Storage/storageAccounts/tableServices/tables@2023-05-01' = {
+  parent: tableService
+  name: 'linkingcodes'
+}
+
+resource linkedAccountsTable 'Microsoft.Storage/storageAccounts/tableServices/tables@2023-05-01' = {
+  parent: tableService
+  name: 'linkedaccounts'
+}
+
+resource usersTable 'Microsoft.Storage/storageAccounts/tableServices/tables@2023-05-01' = {
+  parent: tableService
+  name: 'users'
+}
+
 // ─── Log Analytics Workspace ─────────────────────────────────
 
 resource logAnalytics 'Microsoft.OperationalInsights/workspaces@2023-09-01' = {
