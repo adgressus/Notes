@@ -1,9 +1,9 @@
 {
-    "azureFunctions.deploySubpath": "cloud/functions/get_nonce",
+    "azureFunctions.deploySubpath": "cloud/functions/code",
     "azureFunctions.projectLanguage": "Custom",
     "azureFunctions.projectRuntime": "~4",
     "debug.internalConsoleOptions": "neverOpen",
-    "azureFunctions.projectSubpath": "cloud/functions/get_nonce",
+    "azureFunctions.projectSubpath": "cloud/functions/code",
     "rust-analyzer.linkedProjects": [
         "cloud/functions/code/Cargo.toml",
         "local/macos/Cargo.toml",

@@ -1,11 +1,7 @@
 # Tools
-Tooling is currently macos only, though commands should work with minimal, possibly no changes on linux
+Tooling is currently macos only. Though commands should work with minimal, possibly no changes on linux
 
 #### Setup
-- make script executable before trying to run them
-```
-chmod +x *.sh
-```
 - login to Azure
 ```
 az login
@@ -16,9 +12,17 @@ az login
 ```
 ./add_user.sh
 ```
-- (not implemented) `delete_user.sh`
+- Delete user
+```
+./delete_user.sh <paste user UUID>
+```
 - Create code to link user to authenticator account
 ```
 ./create_link_code.sh <paste user UUID>
 ```
 - (not implemented) `list_users.sh`
+- Delete all expired linking codes
+```
+./clear_expired_codes.sh
+```
+- (not implemented) `show_table_sizes.sh`
