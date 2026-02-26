@@ -36,3 +36,10 @@
 | 'linked_accounts' | *'sub' field from JWT token* | *ISO 8601*  | *string*         | *UUIDv4*\*  | *unix Epoch*  |
 
 \* Foreign Key: users
+
+#### sessions
+| PartitionKey | RowKey                   | Timestamp  | user_id    | created_at    | expires_at    |
+| ------------ | ------------------------ | ---------- | ---------- | ------------- | ------------- |
+| 'sessions'   | *128 char refresh token* | *ISO 8601* | *UUIDv4*\* | *unix Epoch*  | *unix Epoch*  |
+
+\* Foreign Key: users

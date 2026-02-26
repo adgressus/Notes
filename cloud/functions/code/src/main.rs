@@ -302,19 +302,122 @@ fn get_token(jwt: &str) -> (&'static str, String) {
         }
     };
 
-    // TODO: validate nonce against table storage
     info!("Token requested with nonce: {nonce}, sub: {:?}", claims.sub);
 
-    match get_access_token() {
-        Some(token) => {
-            info!("Storage token acquired successfully");
-            ("200 OK", token)
+    // Verify the nonce exists in Table Storage
+    let account = match env::var("STORAGE_ACCOUNT_NAME") {
+        Ok(a) => a,
+        Err(_) => {
+            error!("STORAGE_ACCOUNT_NAME not set");
+            return ("500 Internal Server Error", "internal error".to_string());
         }
+    };
+
+    let token = match get_access_token() {
+        Some(t) => t,
         None => {
-            error!("Failed to acquire access token");
-            ("500 Internal Server Error", "internal error".to_string())
+            error!("Could not acquire access token for nonce lookup");
+            return ("500 Internal Server Error", "internal error".to_string());
+        }
+    };
+
+    let url = format!(
+        "https://{}.table.core.windows.net/nonces(PartitionKey='nonce',RowKey='{}')",
+        account, nonce
+    );
+
+    // Fetch the nonce row to check expiry
+    let nonce_body = match ureq::get(&url)
+        .header("Authorization", &format!("Bearer {}", token))
+        .header("Accept", "application/json;odata=nometadata")
+        .header("x-ms-version", "2019-02-02")
+        .call()
+    {
+        Ok(resp) => match resp.into_body().read_to_string() {
+            Ok(b) => b,
+            Err(e) => {
+                error!("Failed to read nonce response: {e}");
+                return ("500 Internal Server Error", "internal error".to_string());
+            }
+        },
+        Err(e) => {
+            warn!("Nonce not found in storage: {e}");
+            return ("401 Unauthorized", "invalid nonce".to_string());
+        }
+    };
+
+    // Delete the nonce now that it's been used
+    match ureq::delete(&url)
+        .header("Authorization", &format!("Bearer {}", token))
+        .header("If-Match", "*")
+        .header("x-ms-version", "2019-02-02")
+        .call()
+    {
+        Ok(_) => info!("Nonce deleted: {nonce}"),
+        Err(e) => warn!("Failed to delete nonce: {e}"),
+    }
+
+    // Check if the nonce is expired
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or(Duration::from_secs(0))
+        .as_secs();
+
+    let expires_at = match extract_json_string(&nonce_body, "expires_at")
+        .and_then(|s| s.parse::<u64>().ok())
+    {
+        Some(e) => e,
+        None => {
+            warn!("Nonce row missing expires_at");
+            return ("401 Unauthorized", "invalid nonce".to_string());
+        }
+    };
+
+    if now >= expires_at {
+        warn!("Nonce expired: {nonce}");
+        return ("401 Unauthorized", "nonce expired".to_string());
+    }
+
+    info!("Nonce verified and not expired: {nonce}");
+
+    // Get user ID from the nonce row
+    let user_id = match extract_json_string(&nonce_body, "user_id") {
+        Some(id) => id,
+        None => {
+            warn!("Nonce row missing user_id");
+            return ("400 Bad Request", "missing user id".to_string());
+        }
+    };
+
+    // Generate a 128-char refresh token
+    let mut rng = rand::rng();
+    let refresh_token: String = (0..64)
+        .map(|_| format!("{:02x}", rng.random::<u8>()))
+        .collect();
+
+    // Store session in Table Storage
+    let session_url = format!("https://{}.table.core.windows.net/sessions", account);
+    let expires_at = now + 86400; // 1 day
+    let session_body = format!(
+        r#"{{"PartitionKey": "sessions", "RowKey": "{refresh_token}", "user_id": "{user_id}", "created_at": "{now}", "expires_at": "{expires_at}"}}"#
+    );
+
+    match ureq::post(&session_url)
+        .header("Authorization", &format!("Bearer {}", token))
+        .header("Content-Type", "application/json")
+        .header("Accept", "application/json;odata=nometadata")
+        .header("x-ms-version", "2019-02-02")
+        .header("Prefer", "return-no-content")
+        .send(session_body.as_bytes())
+    {
+        Ok(_) => info!("Session created for user {user_id}"),
+        Err(e) => {
+            error!("Failed to create session: {e}");
+            return ("500 Internal Server Error", "internal error".to_string());
         }
     }
+
+    ("200 OK", refresh_token)
 }
 
 fn main() {
