@@ -4,8 +4,6 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-aws-config = { version = "1.5", features = ["behavior-version-latest", "rustls"] }
-aws-sdk-s3 = { version = "1.65", features = ["rustls"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
 serde = { version = "1", features = ["derive"] }
@@ -14,6 +12,7 @@ rand = "0.8"
 base64 = "0.22"
 sha2 = "0.10"
 jsonwebtoken = "9"
+httpdate = "1"
 
 [dependencies.windows]
 version = "0.58"

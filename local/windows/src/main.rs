@@ -3,7 +3,6 @@
 use std::mem::zeroed;
 use std::path::PathBuf;
 use std::time::SystemTime;
-use aws_sdk_s3::Client;
 use windows::{
     core::*,
     Win32::{
@@ -23,39 +22,64 @@ static mut MAIN_HWND: HWND = HWND(std::ptr::null_mut());
 static mut INITIAL_CONTENT: Option<String> = None;
 static mut CURRENT_FILE_PATH: Option<PathBuf> = None;
 static mut CURRENT_FILE_NAME: Option<String> = None;
+static mut CONTAINER_SAS_URL: Option<String> = None;
+static mut REFRESH_TOKEN: Option<String> = None;
 
-/// Fetches notes.txt from S3 directly using the SDK
+/// Builds the full blob URL from the container SAS URL and a blob name
+fn build_blob_url(container_sas_url: &str, blob_name: &str) -> String {
+    // SAS URL format: https://account.blob.core.windows.net/container?<sas_params>
+    if let Some(query_start) = container_sas_url.find('?') {
+        let base = &container_sas_url[..query_start];
+        let query = &container_sas_url[query_start..]; // includes '?'
+        format!("{}/{}{}", base.trim_end_matches('/'), blob_name, query)
+    } else {
+        format!("{}/{}", container_sas_url.trim_end_matches('/'), blob_name)
+    }
+}
+
+/// Builds the list blobs URL from the container SAS URL
+fn build_list_url(container_sas_url: &str) -> String {
+    // Append restype=container&comp=list to the SAS query
+    if let Some(query_start) = container_sas_url.find('?') {
+        let base = &container_sas_url[..query_start];
+        let query = &container_sas_url[query_start + 1..]; // skip '?'
+        format!("{}?restype=container&comp=list&{}", base, query)
+    } else {
+        format!("{}?restype=container&comp=list", container_sas_url)
+    }
+}
+
+/// Fetches a blob from Azure Blob Storage using the container SAS URL
 /// Returns the content and the last modified timestamp
-async fn fetch_notes_from_s3(bucket: &str, key: &str) -> std::result::Result<(String, Option<SystemTime>), Box<dyn std::error::Error + Send + Sync>> {
-    println!("[S3] Loading AWS config from environment...");
-    let config = aws_config::load_from_env().await;
-    println!("[S3] AWS config loaded. Region: {:?}", config.region());
-    
-    let client = Client::new(&config);
-    println!("[S3] S3 client created");
+async fn fetch_notes_from_azure(container_sas_url: &str, blob_name: &str) -> std::result::Result<(String, Option<SystemTime>), Box<dyn std::error::Error + Send + Sync>> {
+    let blob_url = build_blob_url(container_sas_url, blob_name);
+    println!("[Azure] Fetching blob '{}'", blob_name);
 
-    println!("[S3] Fetching object from bucket='{}', key='{}'", bucket, key);
-    let response = client
-        .get_object()
-        .bucket(bucket)
-        .key(key)
+    let client = reqwest::Client::new();
+    let response = client.get(&blob_url)
+        .header("x-ms-version", "2020-10-02")
         .send()
         .await?;
 
-    // Get the last modified timestamp from S3
-    let s3_last_modified = response.last_modified().and_then(|dt| {
-        let secs = dt.secs();
-        let nanos = dt.subsec_nanos();
-        SystemTime::UNIX_EPOCH.checked_add(std::time::Duration::new(secs as u64, nanos))
-    });
-    println!("[S3] S3 last modified: {:?}", s3_last_modified);
+    if !response.status().is_success() {
+        let status = response.status();
+        let body = response.text().await.unwrap_or_default();
+        return Err(format!("Azure blob fetch failed ({}): {}", status, body).into());
+    }
 
-    println!("[S3] Response received, reading body...");
-    let bytes = response.body.collect().await?.into_bytes();
-    let content = String::from_utf8_lossy(&bytes).to_string();
-    println!("[S3] Content fetched successfully, {} bytes", content.len());
-    
-    Ok((content, s3_last_modified))
+    // Parse Last-Modified header
+    let last_modified = response.headers().get("Last-Modified")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| {
+            // Format: "Thu, 01 Jan 2026 00:00:00 GMT"
+            httpdate::parse_http_date(s).ok()
+        });
+    println!("[Azure] Last modified: {:?}", last_modified);
+
+    let content = response.text().await?;
+    println!("[Azure] Content fetched successfully, {} bytes", content.len());
+
+    Ok((content, last_modified))
 }
 
 /// Gets the path to the local notes file
@@ -88,64 +112,63 @@ fn read_local_notes() -> Option<String> {
     get_notes_path().and_then(|path| std::fs::read_to_string(&path).ok())
 }
 
-/// Lists all keys in the S3 bucket
-async fn list_s3_keys(bucket: &str) -> std::result::Result<Vec<String>, Box<dyn std::error::Error + Send + Sync>> {
-    println!("[S3 List] Loading AWS config...");
-    let config = aws_config::load_from_env().await;
-    let client = Client::new(&config);
+/// Lists all blobs in the Azure Blob container using the SAS URL
+async fn list_azure_blobs(container_sas_url: &str) -> std::result::Result<Vec<String>, Box<dyn std::error::Error + Send + Sync>> {
+    let list_url = build_list_url(container_sas_url);
+    println!("[Azure List] Listing blobs...");
 
-    let mut keys = Vec::new();
-    let mut continuation_token: Option<String> = None;
+    let client = reqwest::Client::new();
+    let response = client.get(&list_url)
+        .header("x-ms-version", "2020-10-02")
+        .send()
+        .await?;
 
-    loop {
-        let mut request = client.list_objects_v2().bucket(bucket);
-        if let Some(token) = &continuation_token {
-            request = request.continuation_token(token);
-        }
+    if !response.status().is_success() {
+        let status = response.status();
+        let body = response.text().await.unwrap_or_default();
+        return Err(format!("Azure list blobs failed ({}): {}", status, body).into());
+    }
 
-        let response = request.send().await?;
+    let body = response.text().await?;
 
-        for obj in response.contents() {
-            if let Some(key) = obj.key() {
-                keys.push(key.to_string());
-            }
-        }
-
-        if response.is_truncated() == Some(true) {
-            continuation_token = response.next_continuation_token().map(|s| s.to_string());
-        } else {
-            break;
+    // Parse the XML response to extract blob names
+    // The response contains <Blob><Name>...</Name></Blob> elements
+    let mut names = Vec::new();
+    for segment in body.split("<Name>") {
+        if let Some(end) = segment.find("</Name>") {
+            names.push(segment[..end].to_string());
         }
     }
 
-    println!("[S3 List] Found {} keys", keys.len());
-    Ok(keys)
+    println!("[Azure List] Found {} blobs", names.len());
+    Ok(names)
 }
 
-/// Uploads content to S3 bucket
-async fn upload_notes_to_s3(bucket: &str, key: &str, content: &str) -> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    println!("[S3 Upload] Loading AWS config from environment...");
-    let config = aws_config::load_from_env().await;
-    
-    let client = Client::new(&config);
-    println!("[S3 Upload] Uploading to bucket='{}', key='{}'", bucket, key);
-    
-    client
-        .put_object()
-        .bucket(bucket)
-        .key(key)
-        .body(aws_sdk_s3::primitives::ByteStream::from(content.as_bytes().to_vec()))
+/// Uploads content to Azure Blob Storage using the container SAS URL
+async fn upload_notes_to_azure(container_sas_url: &str, blob_name: &str, content: &str) -> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let blob_url = build_blob_url(container_sas_url, blob_name);
+    println!("[Azure Upload] Uploading blob '{}'", blob_name);
+
+    let client = reqwest::Client::new();
+    let response = client.put(&blob_url)
+        .header("x-ms-blob-type", "BlockBlob")
+        .header("x-ms-version", "2020-10-02")
+        .header("Content-Type", "text/plain; charset=utf-8")
+        .body(content.to_string())
         .send()
         .await?;
-    
-    println!("[S3 Upload] Upload successful");
+
+    if !response.status().is_success() {
+        let status = response.status();
+        let body = response.text().await.unwrap_or_default();
+        return Err(format!("Azure upload failed ({}): {}", status, body).into());
+    }
+
+    println!("[Azure Upload] Upload successful");
     Ok(())
 }
 
 fn main() -> Result<()> {
-    // Get bucket name from environment variable
-    let bucket = std::env::var("S3_BUCKET").unwrap_or_default();
-    
     // Check for file path argument, otherwise default to notes.txt
     let args: Vec<String> = std::env::args().collect();
     let (file_path, file_name) = if args.len() > 1 {
@@ -167,15 +190,24 @@ fn main() -> Result<()> {
     
     println!("[Main] File path: {:?}", file_path);
     println!("[Main] File name: {}", file_name);
-    println!("[Main] S3_BUCKET env var: '{}'", bucket);
-    println!("[Main] AWS_REGION env var: '{}'", std::env::var("AWS_REGION").unwrap_or_default());
-    println!("[Main] AWS_ACCESS_KEY_ID env var: '{}'", 
-        std::env::var("AWS_ACCESS_KEY_ID").map(|s| format!("{}...", &s[..4.min(s.len())])).unwrap_or_default());
     
-    // If AWS credentials are not set, show login dialog
-    let aws_key = std::env::var("AWS_ACCESS_KEY_ID").unwrap_or_default();
-    if aws_key.is_empty() {
-        println!("[Main] AWS_ACCESS_KEY_ID not set, showing login dialog");
+    // Check if SAS URL was passed via environment variable (from parent process)
+    if let Ok(sas) = std::env::var("NOTES_SAS_URL") {
+        if !sas.is_empty() {
+            println!("[Main] Found SAS URL from environment");
+            unsafe { CONTAINER_SAS_URL = Some(sas); }
+        }
+    }
+    if let Ok(token) = std::env::var("NOTES_REFRESH_TOKEN") {
+        if !token.is_empty() {
+            unsafe { REFRESH_TOKEN = Some(token); }
+        }
+    }
+    
+    // If no SAS URL is set, show login dialog
+    let has_sas = unsafe { CONTAINER_SAS_URL.is_some() };
+    if !has_sas {
+        println!("[Main] No Azure SAS URL, showing login dialog");
         unsafe {
             let template = build_login_dialog_template();
             let instance = GetModuleHandleW(None).unwrap_or_default();
@@ -189,26 +221,27 @@ fn main() -> Result<()> {
         }
     }
 
-    // Fetch content from S3 in a blocking manner before starting the GUI
-    if !bucket.is_empty() {
+    // Fetch content from Azure Blob Storage before starting the GUI
+    let sas_url = unsafe { CONTAINER_SAS_URL.clone() };
+    println!("[Main] SAS URL after login: {}", if sas_url.is_some() { "present" } else { "missing" });
+    if let Some(ref sas) = sas_url {
         println!("[Main] Creating Tokio runtime...");
         let rt = tokio::runtime::Runtime::new().expect("Failed to create Tokio runtime");
-        println!("[Main] Fetching notes from S3...");
-        match rt.block_on(fetch_notes_from_s3(&bucket, &file_name)) {
-            Ok((s3_content, s3_modified)) => {
-                println!("[Main] Successfully fetched {} bytes from S3", s3_content.len());
+        println!("[Main] Fetching notes from Azure...");
+        match rt.block_on(fetch_notes_from_azure(sas, &file_name)) {
+            Ok((remote_content, remote_modified)) => {
+                println!("[Main] Successfully fetched {} bytes from Azure", remote_content.len());
                 
                 // Compare timestamps to decide which source to use
                 let local_modified = get_local_file_modified_time();
                 println!("[Main] Local file last modified: {:?}", local_modified);
                 
-                let use_s3 = match (s3_modified, local_modified) {
-                    (Some(s3_time), Some(local_time)) => {
-                        if s3_time > local_time {
-                            println!("[Main] S3 is newer, using S3 content and overwriting local file");
-                            // Overwrite local file with S3 content
+                let use_remote = match (remote_modified, local_modified) {
+                    (Some(remote_time), Some(local_time)) => {
+                        if remote_time > local_time {
+                            println!("[Main] Remote is newer, using remote content and overwriting local file");
                             if let Some(path) = get_notes_path() {
-                                if let Err(e) = std::fs::write(&path, &s3_content) {
+                                if let Err(e) = std::fs::write(&path, &remote_content) {
                                     eprintln!("[Main] Failed to overwrite local file: {}", e);
                                 }
                             }
@@ -219,32 +252,30 @@ fn main() -> Result<()> {
                         }
                     }
                     (Some(_), None) => {
-                        println!("[Main] No local file exists, using S3 content");
-                        // Save S3 content to local file
+                        println!("[Main] No local file exists, using remote content");
                         if let Some(path) = get_notes_path() {
-                            if let Err(e) = std::fs::write(&path, &s3_content) {
-                                eprintln!("[Main] Failed to save S3 content to local file: {}", e);
+                            if let Err(e) = std::fs::write(&path, &remote_content) {
+                                eprintln!("[Main] Failed to save remote content to local file: {}", e);
                             }
                         }
                         true
                     }
                     _ => {
-                        println!("[Main] Could not determine S3 timestamp, using S3 content");
+                        println!("[Main] Could not determine remote timestamp, using remote content");
                         true
                     }
                 };
                 
-                let content = if use_s3 {
-                    s3_content
+                let content = if use_remote {
+                    remote_content
                 } else {
-                    read_local_notes().unwrap_or(s3_content)
+                    read_local_notes().unwrap_or(remote_content)
                 };
                 
                 unsafe { INITIAL_CONTENT = Some(content); }
             }
             Err(e) => {
-                eprintln!("[Main] ERROR: Failed to fetch notes from S3: {}", e);
-                // Fall back to local file if S3 fails
+                eprintln!("[Main] ERROR: Failed to fetch notes from Azure: {}", e);
                 if let Some(content) = read_local_notes() {
                     println!("[Main] Falling back to local file");
                     unsafe { INITIAL_CONTENT = Some(content); }
@@ -252,7 +283,7 @@ fn main() -> Result<()> {
             }
         }
     } else {
-        println!("[Main] S3_BUCKET is empty, reading local file only");
+        println!("[Main] No SAS URL available, reading local file only");
         if let Some(content) = read_local_notes() {
             unsafe { INITIAL_CONTENT = Some(content); }
         }
@@ -437,15 +468,14 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                         }
                     }
                     
-                    // Upload to S3 if bucket is configured
-                    let bucket = std::env::var("S3_BUCKET").unwrap_or_default();
-                    if !bucket.is_empty() {
+                    // Upload to Azure Blob Storage if SAS URL is configured
+                    if let Some(ref sas) = CONTAINER_SAS_URL {
                         let key = get_current_key();
-                        println!("[Save] Uploading to S3 with key '{}'...", key);
+                        println!("[Save] Uploading to Azure with key '{}'...", key);
                         let rt = tokio::runtime::Runtime::new().expect("Failed to create Tokio runtime");
-                        match rt.block_on(upload_notes_to_s3(&bucket, &key, &text)) {
-                            Ok(_) => println!("[Save] Successfully uploaded to S3"),
-                            Err(e) => eprintln!("[Save] Failed to upload to S3: {}", e),
+                        match rt.block_on(upload_notes_to_azure(sas, &key, &text)) {
+                            Ok(_) => println!("[Save] Successfully uploaded to Azure"),
+                            Err(e) => eprintln!("[Save] Failed to upload to Azure: {}", e),
                         }
                     }
                 }
@@ -521,12 +551,11 @@ unsafe fn show_save_as_dialog(hwnd: HWND) {
         println!("[SaveAs] Saved to {:?}", new_path);
     }
     
-    // Upload to S3 if configured
-    let bucket = std::env::var("S3_BUCKET").unwrap_or_default();
-    if !bucket.is_empty() {
+    // Upload to Azure if SAS URL is configured
+    if let Some(ref sas) = CONTAINER_SAS_URL {
         let rt = tokio::runtime::Runtime::new().expect("Failed to create Tokio runtime");
-        if let Err(e) = rt.block_on(upload_notes_to_s3(&bucket, &new_filename, &text)) {
-            eprintln!("[SaveAs] S3 upload failed: {}", e);
+        if let Err(e) = rt.block_on(upload_notes_to_azure(sas, &new_filename, &text)) {
+            eprintln!("[SaveAs] Azure upload failed: {}", e);
         }
     }
 }
@@ -597,60 +626,60 @@ unsafe fn show_new_file_dialog() {
     let local_exists = new_path.exists();
     let local_modified = std::fs::metadata(&new_path).ok().and_then(|m| m.modified().ok());
     
-    // Check S3 for existing file
-    let bucket = std::env::var("S3_BUCKET").unwrap_or_default();
-    let mut s3_content: Option<String> = None;
-    let mut s3_modified: Option<SystemTime> = None;
+    // Check Azure for existing file
+    let sas_url = CONTAINER_SAS_URL.clone();
+    let mut remote_content: Option<String> = None;
+    let mut remote_modified: Option<SystemTime> = None;
     
-    if !bucket.is_empty() {
+    if let Some(ref sas) = sas_url {
         let rt = tokio::runtime::Runtime::new().expect("Failed to create Tokio runtime");
-        match rt.block_on(fetch_notes_from_s3(&bucket, &new_filename)) {
+        match rt.block_on(fetch_notes_from_azure(sas, &new_filename)) {
             Ok((content, modified)) => {
-                s3_content = Some(content);
-                s3_modified = modified;
-                println!("[NewFile] Found S3 file, modified: {:?}", s3_modified);
+                remote_content = Some(content);
+                remote_modified = modified;
+                println!("[NewFile] Found Azure blob, modified: {:?}", remote_modified);
             }
             Err(e) => {
-                println!("[NewFile] No S3 file found or error: {}", e);
+                println!("[NewFile] No Azure blob found or error: {}", e);
             }
         }
     }
     
     // Determine what to do based on existence and timestamps
-    match (local_exists, s3_content.is_some()) {
+    match (local_exists, remote_content.is_some()) {
         (false, false) => {
-            // Neither exists - create new empty file locally and in S3
+            // Neither exists - create new empty file locally and in Azure
             println!("[NewFile] Creating new empty file");
             if let Err(e) = std::fs::write(&new_path, "") {
                 eprintln!("[NewFile] Failed to create file: {}", e);
                 return;
             }
-            if !bucket.is_empty() {
+            if let Some(ref sas) = sas_url {
                 let rt = tokio::runtime::Runtime::new().expect("Failed to create Tokio runtime");
-                if let Err(e) = rt.block_on(upload_notes_to_s3(&bucket, &new_filename, "")) {
-                    eprintln!("[NewFile] S3 upload failed: {}", e);
+                if let Err(e) = rt.block_on(upload_notes_to_azure(sas, &new_filename, "")) {
+                    eprintln!("[NewFile] Azure upload failed: {}", e);
                 }
             }
         }
         (true, false) => {
-            // Local exists, no S3 - use local as-is
-            println!("[NewFile] Using existing local file (no S3 version)");
+            // Local exists, no remote - use local as-is
+            println!("[NewFile] Using existing local file (no remote version)");
         }
         (false, true) => {
-            // S3 exists, no local - download from S3
-            println!("[NewFile] Downloading from S3 (no local file)");
-            if let Some(content) = &s3_content {
+            // Remote exists, no local - download from Azure
+            println!("[NewFile] Downloading from Azure (no local file)");
+            if let Some(content) = &remote_content {
                 if let Err(e) = std::fs::write(&new_path, content) {
-                    eprintln!("[NewFile] Failed to save S3 content locally: {}", e);
+                    eprintln!("[NewFile] Failed to save remote content locally: {}", e);
                 }
             }
         }
         (true, true) => {
             // Both exist - compare timestamps
-            match (s3_modified, local_modified) {
-                (Some(s3_time), Some(local_time)) if s3_time > local_time => {
-                    println!("[NewFile] S3 is newer, overwriting local file");
-                    if let Some(content) = &s3_content {
+            match (remote_modified, local_modified) {
+                (Some(remote_time), Some(local_time)) if remote_time > local_time => {
+                    println!("[NewFile] Remote is newer, overwriting local file");
+                    if let Some(content) = &remote_content {
                         if let Err(e) = std::fs::write(&new_path, content) {
                             eprintln!("[NewFile] Failed to overwrite local file: {}", e);
                         }
@@ -665,12 +694,18 @@ unsafe fn show_new_file_dialog() {
     
     // Spawn a new instance of this program with the file path as argument
     let exe_path = std::env::current_exe().expect("Failed to get current exe path");
-    match std::process::Command::new(&exe_path)
-        .arg(&new_path)
+    let mut cmd = std::process::Command::new(&exe_path);
+    cmd.arg(&new_path)
         .stdout(std::process::Stdio::inherit())
-        .stderr(std::process::Stdio::inherit())
-        .spawn()
-    {
+        .stderr(std::process::Stdio::inherit());
+    // Pass SAS URL and refresh token to the child process
+    if let Some(ref sas) = CONTAINER_SAS_URL {
+        cmd.env("NOTES_SAS_URL", sas);
+    }
+    if let Some(ref token) = REFRESH_TOKEN {
+        cmd.env("NOTES_REFRESH_TOKEN", token);
+    }
+    match cmd.spawn() {
         Ok(_) => println!("[NewFile] Spawned new window for {:?}", new_path),
         Err(e) => eprintln!("[NewFile] Failed to spawn new window: {}", e),
     }
@@ -684,6 +719,10 @@ const IDC_CANCEL: i32 = 2;
 // Dialog control IDs for the login dialog
 const IDC_LOGIN_BTN: i32 = 201;
 const IDC_LOGIN_CANCEL: i32 = 202;
+const IDC_LINK_CODE_EDIT: i32 = 203;
+const IDC_LINK_ACCOUNTS_BTN: i32 = 204;
+const ES_NUMBER: u32 = 0x2000;
+const EM_LIMITTEXT: u32 = 0x00C5;
 
 static mut PICKER_KEYS: Option<Vec<String>> = None;
 static mut PICKER_SELECTED: Option<String> = None;
@@ -847,11 +886,11 @@ fn build_login_dialog_template() -> Vec<u16> {
     buf.push(style as u16);
     buf.push((style >> 16) as u16);
     buf.push(0); buf.push(0); // dwExtendedStyle low, high
-    buf.push(3); // cdit - number of controls (static text, login button, cancel button)
+    buf.push(5); // cdit - number of controls (static text, login button, link code edit, link accounts button, cancel button)
     buf.push(80);  // x
     buf.push(80);  // y
     buf.push(220); // cx
-    buf.push(90);  // cy
+    buf.push(120); // cy
     buf.push(0);   // menu (none)
     buf.push(0);   // class (default)
     // title: "Login Required"
@@ -896,14 +935,47 @@ fn build_login_dialog_template() -> Vec<u16> {
     buf.push(0); // title (empty - we draw it ourselves)
     buf.push(0); // creation data length
 
-    // --- Control 3: Cancel button ---
+    // --- Control 3: Link code textbox (6-digit, number only) ---
+    align4(&mut buf);
+    let edit_style: u32 = WS_CHILD.0 | WS_VISIBLE.0 | WS_TABSTOP.0 | WS_BORDER.0 | ES_NUMBER;
+    buf.push(edit_style as u16);
+    buf.push((edit_style >> 16) as u16);
+    buf.push(0); buf.push(0); // dwExtendedStyle
+    buf.push(20);  // x
+    buf.push(69);  // y
+    buf.push(50);  // cx
+    buf.push(14);  // cy
+    buf.push(IDC_LINK_CODE_EDIT as u16); // id
+    buf.push(0xFFFF);
+    buf.push(0x0081); // edit class
+    buf.push(0); // title (empty)
+    buf.push(0); // creation data length
+
+    // --- Control 4: Link Accounts button ---
+    align4(&mut buf);
+    let link_btn_style: u32 = WS_CHILD.0 | WS_VISIBLE.0 | WS_TABSTOP.0 | BS_PUSHBUTTON as u32;
+    buf.push(link_btn_style as u16);
+    buf.push((link_btn_style >> 16) as u16);
+    buf.push(0); buf.push(0); // dwExtendedStyle
+    buf.push(75);  // x
+    buf.push(69);  // y
+    buf.push(65);  // cx
+    buf.push(14);  // cy
+    buf.push(IDC_LINK_ACCOUNTS_BTN as u16); // id
+    buf.push(0xFFFF);
+    buf.push(0x0080); // button class
+    for c in "Link Accounts".encode_utf16() { buf.push(c); }
+    buf.push(0);
+    buf.push(0); // creation data length
+
+    // --- Control 5: Cancel button ---
     align4(&mut buf);
     let btn_style2: u32 = WS_CHILD.0 | WS_VISIBLE.0 | WS_TABSTOP.0 | BS_PUSHBUTTON as u32;
     buf.push(btn_style2 as u16);
     buf.push((btn_style2 >> 16) as u16);
     buf.push(0); buf.push(0); // dwExtendedStyle
     buf.push(85);  // x
-    buf.push(68);  // y
+    buf.push(96);  // y
     buf.push(50);  // cx
     buf.push(14);  // cy
     buf.push(IDC_LOGIN_CANCEL as u16); // id
@@ -996,10 +1068,116 @@ unsafe fn draw_microsoft_sign_in_button(dis: &windows::Win32::UI::Controls::DRAW
     let _ = DeleteObject(font);
 }
 
+/// Performs the login flow: fetches nonce (with optional link_code), runs OAuth, exchanges token
+unsafe fn perform_login(hwnd: HWND, link_code: Option<String>) {
+    let rt = tokio::runtime::Runtime::new().expect("Failed to create Tokio runtime");
+
+    // Build nonce URL with optional link_code
+    let nonce_url = match &link_code {
+        Some(code) => format!("https://notes-auth-func.azurewebsites.net/api/get_nonce?link_code={}", code),
+        None => "https://notes-auth-func.azurewebsites.net/api/get_nonce".to_string(),
+    };
+    println!("[Login] Fetching nonce from: {}", nonce_url);
+
+    // Fetch nonce from Azure Function
+    let nonce = match rt.block_on(async {
+        let resp = reqwest::get(&nonce_url).await?;
+        resp.text().await
+    }) {
+        Ok(n) => {
+            println!("[Login] Received nonce: {}", n);
+            n
+        }
+        Err(e) => {
+            eprintln!("[Login] Failed to fetch nonce: {}", e);
+            let msg = format!("Failed to fetch nonce:\n{}\0", e);
+            let msg_wide: Vec<u16> = msg.encode_utf16().collect();
+            MessageBoxW(hwnd, PCWSTR(msg_wide.as_ptr()), w!("Login Error"), MB_OK | MB_ICONERROR);
+            return;
+        }
+    };
+
+    println!("[Login] Starting OAuth2 flow with nonce...");
+    match rt.block_on(microsoft_auth::login_with_microsoft(&nonce)) {
+        Ok(token_response) => {
+            println!("[Login] Successfully authenticated!");
+            println!("[Login] Access token: {}...", &token_response.access_token[..20.min(token_response.access_token.len())]);
+            if let Some(ref id_token) = token_response.id_token {
+                println!("[Login] ID token received ({} chars)", id_token.len());
+            }
+
+            // Send the id_token to the backend to exchange for AWS credentials
+            let post_token = token_response.id_token.as_deref()
+                .unwrap_or(&token_response.access_token);
+            println!("[Login] Sending token to get_token endpoint...");
+            match rt.block_on(async {
+                let client = reqwest::Client::new();
+                let resp = client
+                    .post("https://notes-auth-func.azurewebsites.net/api/get_token")
+                    .body(post_token.to_string())
+                    .send()
+                    .await?;
+                resp.text().await
+            }) {
+                Ok(refresh_token) => {
+                    println!("[Login] Refresh token: {}", refresh_token);
+
+                    // Call get_url with the refresh token
+                    match rt.block_on(async {
+                        let client = reqwest::Client::new();
+                        let resp = client
+                            .post("https://notes-auth-func.azurewebsites.net/api/get_url")
+                            .body(refresh_token)
+                            .send()
+                            .await?;
+                        resp.text().await
+                    }) {
+                        Ok(url_response) => {
+                            println!("[Login] get_url response: {}", url_response);
+                            match serde_json::from_str::<serde_json::Value>(&url_response) {
+                                Ok(json) => {
+                                    if let Some(new_token) = json.get("refresh_token").and_then(|v| v.as_str()) {
+                                        println!("[Login] New refresh token: {}", new_token);
+                                        REFRESH_TOKEN = Some(new_token.to_string());
+                                    }
+                                    if let Some(url) = json.get("url").and_then(|v| v.as_str()) {
+                                        println!("[Login] Container SAS URL: {}", url);
+                                        CONTAINER_SAS_URL = Some(url.to_string());
+                                    }
+                                }
+                                Err(e) => {
+                                    eprintln!("[Login] Failed to parse get_url response: {}", e);
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            eprintln!("[Login] Failed to call get_url: {}", e);
+                        }
+                    }
+                }
+                Err(e) => {
+                    eprintln!("[Login] Failed to send token to get_token: {}", e);
+                }
+            }
+
+            let _ = EndDialog(hwnd, 1);
+        }
+        Err(e) => {
+            eprintln!("[Login] Authentication failed: {}", e);
+            let msg = format!("Authentication failed:\n{}\0", e);
+            let msg_wide: Vec<u16> = msg.encode_utf16().collect();
+            MessageBoxW(hwnd, PCWSTR(msg_wide.as_ptr()), w!("Login Error"), MB_OK | MB_ICONERROR);
+        }
+    }
+}
+
 /// Dialog procedure for the login dialog
 unsafe extern "system" fn login_dlg_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> isize {
     match msg {
         WM_INITDIALOG => {
+            // Set 6-character limit on the link code textbox
+            let edit = GetDlgItem(hwnd, IDC_LINK_CODE_EDIT).unwrap_or_default();
+            SendMessageW(edit, EM_LIMITTEXT, WPARAM(6), LPARAM(0));
             1 // TRUE - let system set focus
         }
         WM_DRAWITEM => {
@@ -1013,66 +1191,23 @@ unsafe extern "system" fn login_dlg_proc(hwnd: HWND, msg: u32, wparam: WPARAM, l
         WM_COMMAND => {
             let control_id = (wparam.0 & 0xFFFF) as i32;
             if control_id == IDC_LOGIN_BTN {
-                println!("[Login] Sign in with Microsoft clicked, fetching nonce...");
-                let rt = tokio::runtime::Runtime::new().expect("Failed to create Tokio runtime");
-                
-                // Fetch nonce from Azure Function
-                let nonce = match rt.block_on(async {
-                    let resp = reqwest::get("https://notes-auth-func.azurewebsites.net/api/get_nonce").await?;
-                    resp.text().await
-                }) {
-                    Ok(n) => {
-                        println!("[Login] Received nonce: {}", n);
-                        n
-                    }
-                    Err(e) => {
-                        eprintln!("[Login] Failed to fetch nonce: {}", e);
-                        let msg = format!("Failed to fetch nonce:\n{}\0", e);
-                        let msg_wide: Vec<u16> = msg.encode_utf16().collect();
-                        MessageBoxW(hwnd, PCWSTR(msg_wide.as_ptr()), w!("Login Error"), MB_OK | MB_ICONERROR);
-                        return 0;
-                    }
-                };
-                
-                println!("[Login] Starting OAuth2 flow with nonce...");
-                match rt.block_on(microsoft_auth::login_with_microsoft(&nonce)) {
-                    Ok(token_response) => {
-                        println!("[Login] Successfully authenticated!");
-                        println!("[Login] Access token: {}...", &token_response.access_token[..20.min(token_response.access_token.len())]);
-                        if let Some(ref id_token) = token_response.id_token {
-                            println!("[Login] ID token received ({} chars)", id_token.len());
-                        }
+                println!("[Login] Sign in with Microsoft clicked");
+                perform_login(hwnd, None);
+                0
+            } else if control_id == IDC_LINK_ACCOUNTS_BTN {
+                // Read the link code from the textbox
+                let edit_hwnd = GetDlgItem(hwnd, IDC_LINK_CODE_EDIT).unwrap_or_default();
+                let mut buf = [0u16; 7];
+                let len = GetWindowTextW(edit_hwnd, &mut buf);
+                let link_code = String::from_utf16_lossy(&buf[..len as usize]);
 
-                        // Send the id_token to the backend to exchange for AWS credentials
-                        let post_token = token_response.id_token.as_deref()
-                            .unwrap_or(&token_response.access_token);
-                        println!("[Login] Sending token to get_token endpoint...");
-                        match rt.block_on(async {
-                            let client = reqwest::Client::new();
-                            let resp = client
-                                .post("https://notes-auth-func.azurewebsites.net/api/get_token")
-                                .body(post_token.to_string())
-                                .send()
-                                .await?;
-                            resp.text().await
-                        }) {
-                            Ok(response_text) => {
-                                println!("[Login] get_token response: {}", response_text);
-                            }
-                            Err(e) => {
-                                eprintln!("[Login] Failed to send token to get_token: {}", e);
-                            }
-                        }
-
-                        let _ = EndDialog(hwnd, 1);
-                    }
-                    Err(e) => {
-                        eprintln!("[Login] Authentication failed: {}", e);
-                        let msg = format!("Authentication failed:\n{}\0", e);
-                        let msg_wide: Vec<u16> = msg.encode_utf16().collect();
-                        MessageBoxW(hwnd, PCWSTR(msg_wide.as_ptr()), w!("Login Error"), MB_OK | MB_ICONERROR);
-                    }
+                if link_code.len() != 6 || !link_code.chars().all(|c| c.is_ascii_digit()) {
+                    MessageBoxW(hwnd, w!("Please enter exactly 6 digits."), w!("Invalid Code"), MB_OK | MB_ICONWARNING);
+                    return 0;
                 }
+
+                println!("[Login] Link Accounts clicked with code: {}", link_code);
+                perform_login(hwnd, Some(link_code));
                 0
             } else if control_id == IDC_LOGIN_CANCEL {
                 let _ = EndDialog(hwnd, 0);
@@ -1089,26 +1224,28 @@ unsafe extern "system" fn login_dlg_proc(hwnd: HWND, msg: u32, wparam: WPARAM, l
     }
 }
 
-/// Shows the S3 file picker dialog and opens the selected file in a new window
+/// Shows the Azure blob picker dialog and opens the selected file in a new window
 unsafe fn show_open_file_dialog() {
-    let bucket = std::env::var("S3_BUCKET").unwrap_or_default();
-    if bucket.is_empty() {
-        eprintln!("[OpenFile] S3_BUCKET not configured");
-        return;
-    }
+    let sas_url = match CONTAINER_SAS_URL.clone() {
+        Some(url) => url,
+        None => {
+            eprintln!("[OpenFile] No Azure SAS URL configured");
+            return;
+        }
+    };
 
-    // List keys from S3
+    // List blobs from Azure
     let rt = tokio::runtime::Runtime::new().expect("Failed to create Tokio runtime");
-    let keys = match rt.block_on(list_s3_keys(&bucket)) {
+    let keys = match rt.block_on(list_azure_blobs(&sas_url)) {
         Ok(keys) => keys,
         Err(e) => {
-            eprintln!("[OpenFile] Failed to list S3 keys: {}", e);
+            eprintln!("[OpenFile] Failed to list Azure blobs: {}", e);
             return;
         }
     };
 
     if keys.is_empty() {
-        println!("[OpenFile] No files found in S3 bucket");
+        println!("[OpenFile] No blobs found in Azure container");
         return;
     }
 
@@ -1159,44 +1296,44 @@ unsafe fn show_open_file_dialog() {
 
     let new_path = notes_dir.join(&selected_key);
 
-    // Fetch from S3 and compare with local (same pattern as show_new_file_dialog)
+    // Fetch from Azure and compare with local
     let local_exists = new_path.exists();
     let local_modified = std::fs::metadata(&new_path).ok().and_then(|m| m.modified().ok());
 
-    let mut s3_content: Option<String> = None;
-    let mut s3_modified: Option<SystemTime> = None;
+    let mut remote_content: Option<String> = None;
+    let mut remote_modified: Option<SystemTime> = None;
 
-    match rt.block_on(fetch_notes_from_s3(&bucket, &selected_key)) {
+    match rt.block_on(fetch_notes_from_azure(&sas_url, &selected_key)) {
         Ok((content, modified)) => {
-            s3_content = Some(content);
-            s3_modified = modified;
+            remote_content = Some(content);
+            remote_modified = modified;
         }
         Err(e) => {
-            eprintln!("[OpenFile] Failed to fetch S3 content: {}", e);
+            eprintln!("[OpenFile] Failed to fetch Azure content: {}", e);
         }
     }
 
-    match (local_exists, s3_content.is_some()) {
+    match (local_exists, remote_content.is_some()) {
         (false, false) => {
-            println!("[OpenFile] Neither local nor S3 content available");
+            println!("[OpenFile] Neither local nor remote content available");
             return;
         }
         (true, false) => {
             println!("[OpenFile] Using existing local file");
         }
         (false, true) => {
-            println!("[OpenFile] Downloading from S3");
-            if let Some(content) = &s3_content {
+            println!("[OpenFile] Downloading from Azure");
+            if let Some(content) = &remote_content {
                 if let Err(e) = std::fs::write(&new_path, content) {
-                    eprintln!("[OpenFile] Failed to save S3 content locally: {}", e);
+                    eprintln!("[OpenFile] Failed to save remote content locally: {}", e);
                 }
             }
         }
         (true, true) => {
-            match (s3_modified, local_modified) {
-                (Some(s3_time), Some(local_time)) if s3_time > local_time => {
-                    println!("[OpenFile] S3 is newer, overwriting local file");
-                    if let Some(content) = &s3_content {
+            match (remote_modified, local_modified) {
+                (Some(remote_time), Some(local_time)) if remote_time > local_time => {
+                    println!("[OpenFile] Remote is newer, overwriting local file");
+                    if let Some(content) = &remote_content {
                         if let Err(e) = std::fs::write(&new_path, content) {
                             eprintln!("[OpenFile] Failed to overwrite local file: {}", e);
                         }
@@ -1211,12 +1348,18 @@ unsafe fn show_open_file_dialog() {
 
     // Spawn a new instance for the selected file
     let exe_path = std::env::current_exe().expect("Failed to get current exe path");
-    match std::process::Command::new(&exe_path)
-        .arg(&new_path)
+    let mut cmd = std::process::Command::new(&exe_path);
+    cmd.arg(&new_path)
         .stdout(std::process::Stdio::inherit())
-        .stderr(std::process::Stdio::inherit())
-        .spawn()
-    {
+        .stderr(std::process::Stdio::inherit());
+    // Pass SAS URL and refresh token to the child process
+    if let Some(ref sas) = CONTAINER_SAS_URL {
+        cmd.env("NOTES_SAS_URL", sas);
+    }
+    if let Some(ref token) = REFRESH_TOKEN {
+        cmd.env("NOTES_REFRESH_TOKEN", token);
+    }
+    match cmd.spawn() {
         Ok(_) => println!("[OpenFile] Spawned new window for {:?}", new_path),
         Err(e) => eprintln!("[OpenFile] Failed to spawn new window: {}", e),
     }
