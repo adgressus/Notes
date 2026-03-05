@@ -30,6 +30,7 @@ use aws_config;
 use aws_sdk_s3::Client as S3Client;
 // Using `aws_config::load_from_env()` to get credentials from environment/profile.
 use aws_sdk_s3::primitives::ByteStream;
+use aws_sdk_s3::presigning::PresigningConfig;
 use chrono::Utc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -397,7 +398,13 @@ fn auto_save_all_windows(mtm: MainThreadMarker) {
             if let Some(app_delegate) = get_s3_client(mtm) {
                 if let Some(client) = app_delegate.ivars().s3_client.get() {
                     match s3_upload(client, &bucket, &key, content.clone().into_bytes()) {
-                        Ok(_) => println!("Auto-save: S3 upload succeeded for s3://{}/{}", bucket, key),
+                        Ok(_) => {
+                            println!("Auto-save: S3 upload succeeded for s3://{}/{}", bucket, key);
+                            match s3_presign_url(client, &bucket, &key, 3600) {
+                                Ok(url) => println!("Presigned URL (1h): {}", url),
+                                Err(e) => eprintln!("Failed to generate presigned URL: {:?}", e),
+                            }
+                        }
                         Err(e) => {
                             eprintln!("Auto-save: S3 upload failed: {:?}", e);
                             print_error_chain(&*e);
@@ -431,6 +438,24 @@ fn s3_upload(client: &S3Client, bucket: &str, key: &str, body: Vec<u8>) -> Resul
             .await
             .map(|_| ())
             .map_err(|e| Box::<dyn std::error::Error + Send + Sync>::from(e))
+    })
+}
+
+/// Generate a presigned GET URL for an S3 object.
+fn s3_presign_url(client: &S3Client, bucket: &str, key: &str, expires_secs: u64) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+    let rt = tokio::runtime::Runtime::new()?;
+    let bucket = bucket.to_string();
+    let key = key.to_string();
+    rt.block_on(async {
+        let presigning_config = PresigningConfig::expires_in(Duration::from_secs(expires_secs))?;
+        let presigned = client
+            .get_object()
+            .bucket(&bucket)
+            .key(&key)
+            .presigned(presigning_config)
+            .await
+            .map_err(|e| Box::<dyn std::error::Error + Send + Sync>::from(e))?;
+        Ok(presigned.uri().to_string())
     })
 }
 

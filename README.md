@@ -24,9 +24,9 @@
 \* Foreign Key: users
 
 #### nonces
-| PartitionKey | RowKey          | Timestamp   | user_id     | created_at    | expires_at    |
-| ------------ | --------------- | ----------- | ----------- | ------------- | ------------- |
-| 'nonce'      | *64 char nonce* | *ISO 8601*  | *UUIDv4*\*  | *unix Epoch*  | *unix Epoch*  |
+| PartitionKey | RowKey          | Timestamp   | user_id     | linking_session | created_at    | expires_at    |
+| ------------ | --------------- | ----------- | ----------- | --------------- | ------------- | ------------- |
+| 'nonce'      | *64 char nonce* | *ISO 8601*  | *UUIDv4*\*  | *boolean*       | *unix Epoch*  | *unix Epoch*  |
 
 \* Foreign Key: users
 

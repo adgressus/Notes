@@ -2,11 +2,13 @@
 
 param location string
 param storageAccountName string
+param userStorageAccountName string
 param planName string
 param functionAppName string
 param logAnalyticsName string
 param appInsightsName string
 param deploymentContainerName string
+param userBlobContainerName string
 param azureTenantId string
 param azureClientId string
 
@@ -67,6 +69,40 @@ resource linkedAccountsTable 'Microsoft.Storage/storageAccounts/tableServices/ta
 resource usersTable 'Microsoft.Storage/storageAccounts/tableServices/tables@2023-05-01' = {
   parent: tableService
   name: 'users'
+}
+
+resource sessionsTable 'Microsoft.Storage/storageAccounts/tableServices/tables@2023-05-01' = {
+  parent: tableService
+  name: 'sessions'
+}
+
+// ─── User Storage Account ────────────────────────────────────
+
+resource userStorageAccount 'Microsoft.Storage/storageAccounts@2023-05-01' = {
+  name: userStorageAccountName
+  location: location
+  sku: {
+    name: 'Standard_LRS'
+  }
+  kind: 'StorageV2'
+  properties: {
+    supportsHttpsTrafficOnly: true
+    minimumTlsVersion: 'TLS1_2'
+    allowBlobPublicAccess: false
+  }
+}
+
+resource userBlobService 'Microsoft.Storage/storageAccounts/blobServices@2023-05-01' = {
+  parent: userStorageAccount
+  name: 'default'
+}
+
+resource userBlobContainer 'Microsoft.Storage/storageAccounts/blobServices/containers@2023-05-01' = {
+  parent: userBlobService
+  name: userBlobContainerName
+  properties: {
+    publicAccess: 'None'
+  }
 }
 
 // ─── Log Analytics Workspace ─────────────────────────────────
@@ -155,6 +191,10 @@ resource functionApp 'Microsoft.Web/sites@2024-04-01' = {
           value: storageAccount.name
         }
         {
+          name: 'USER_STORAGE_ACCOUNT_NAME'
+          value: userStorageAccount.name
+        }
+        {
           name: 'AZURE_TENANT_ID'
           value: azureTenantId
         }
@@ -203,6 +243,42 @@ resource blobRbac 'Microsoft.Authorization/roleAssignments@2022-04-01' = {
   }
 }
 
+// ─── RBAC: Storage Blob Data Contributor (user storage) ──────
+// Allows the Function App to read/write blobs in the user storage account
+
+var storageBlobDataContributorRole = subscriptionResourceId(
+  'Microsoft.Authorization/roleDefinitions',
+  'ba92f5b4-2d11-453d-a403-e96b0029c9fe'
+)
+
+resource userBlobContributorRbac 'Microsoft.Authorization/roleAssignments@2022-04-01' = {
+  name: guid(userStorageAccount.id, functionApp.id, storageBlobDataContributorRole)
+  scope: userStorageAccount
+  properties: {
+    roleDefinitionId: storageBlobDataContributorRole
+    principalId: functionApp.identity.principalId
+    principalType: 'ServicePrincipal'
+  }
+}
+
+// ─── RBAC: Storage Blob Delegator (user storage) ─────────────
+// Allows the Function App to obtain user delegation keys for SAS generation
+
+var storageBlobDelegatorRole = subscriptionResourceId(
+  'Microsoft.Authorization/roleDefinitions',
+  'db58b8e5-c6ad-4a2a-8342-4190687cbf4a'
+)
+
+resource userBlobDelegatorRbac 'Microsoft.Authorization/roleAssignments@2022-04-01' = {
+  name: guid(userStorageAccount.id, functionApp.id, storageBlobDelegatorRole)
+  scope: userStorageAccount
+  properties: {
+    roleDefinitionId: storageBlobDelegatorRole
+    principalId: functionApp.identity.principalId
+    principalType: 'ServicePrincipal'
+  }
+}
+
 // ─── Diagnostic Settings ─────────────────────────────────────
 // Collect all Function App logs and metrics to Log Analytics
 
@@ -231,4 +307,5 @@ resource functionAppDiagnostics 'Microsoft.Insights/diagnosticSettings@2021-05-0
 output functionAppName string = functionApp.name
 output functionAppUrl string = 'https://${functionApp.properties.defaultHostName}'
 output storageAccountName string = storageAccount.name
+output userStorageAccountName string = userStorageAccount.name
 output appInsightsName string = appInsights.name
