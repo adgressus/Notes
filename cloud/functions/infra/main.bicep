@@ -14,11 +14,13 @@ param baseName string = 'notes'
 
 var resourceGroupName = '${baseName}-auth-rg'
 var storageAccountName = '${baseName}authstorage'
+var userStorageAccountName = '${baseName}userstorage'
 var planName = '${baseName}-auth-plan'
 var functionAppName = '${baseName}-auth-func'
 var logAnalyticsName = '${baseName}-auth-logs'
 var appInsightsName = '${baseName}-auth-insights'
 var deploymentContainerName = 'deployments'
+var userBlobContainerName = 'notes-user-storage'
 
 @description('Azure AD tenant ID for JWT validation')
 param azureTenantId string
@@ -41,11 +43,13 @@ module resources 'resources.bicep' = {
   params: {
     location: location
     storageAccountName: storageAccountName
+    userStorageAccountName: userStorageAccountName
     planName: planName
     functionAppName: functionAppName
     logAnalyticsName: logAnalyticsName
     appInsightsName: appInsightsName
     deploymentContainerName: deploymentContainerName
+    userBlobContainerName: userBlobContainerName
     azureTenantId: azureTenantId
     azureClientId: azureClientId
   }
@@ -57,4 +61,5 @@ output resourceGroupName string = rg.name
 output functionAppName string = resources.outputs.functionAppName
 output functionAppUrl string = resources.outputs.functionAppUrl
 output storageAccountName string = resources.outputs.storageAccountName
+output userStorageAccountName string = resources.outputs.userStorageAccountName
 output appInsightsName string = resources.outputs.appInsightsName
