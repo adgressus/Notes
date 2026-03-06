@@ -1,3 +1,5 @@
+mod table;
+
 use std::env;
 use std::io::{BufRead, BufReader, Write};
 use std::net::TcpListener;
@@ -12,13 +14,8 @@ use rand::RngExt;
 use serde::Deserialize;
 use sha2::Sha256;
 
-struct CachedToken {
-    token: String,
-    acquired_at: Instant,
-    expires_in: u64,
-}
+use table::TableError;
 
-static TOKEN_CACHE: Mutex<Option<CachedToken>> = Mutex::new(None);
 static JWKS_CACHE: Mutex<Option<CachedJwks>> = Mutex::new(None);
 
 #[derive(Deserialize)]
@@ -63,7 +60,7 @@ impl Log for ConsoleLogger {
 
     fn log(&self, record: &Record) {
         if self.enabled(record.metadata()) {
-            eprintln!("[{}] {}", record.level(), record.args());
+            eprintln!("[{}] {}: {}", record.level(), record.module_path().unwrap_or("unknown"), record.args());
         }
     }
 
@@ -72,9 +69,9 @@ impl Log for ConsoleLogger {
 
 static LOGGER: ConsoleLogger = ConsoleLogger;
 
-fn generate_nonce() -> String {
+fn random_hex(bytes: usize) -> String {
     let mut rng = rand::rng();
-    (0..32)
+    (0..bytes)
         .map(|_| format!("{:02x}", rng.random::<u8>()))
         .collect()
 }
@@ -82,190 +79,13 @@ fn generate_nonce() -> String {
 fn extract_json_string(json: &str, key: &str) -> Option<String> {
     let pattern = format!(r#""{}":"#, key);
     let start = json.find(&pattern)? + pattern.len();
-    let rest = &json[start..];
-    // skip whitespace
-    let rest = rest.trim_start();
+    let rest = json[start..].trim_start();
     if !rest.starts_with('"') {
         return None;
     }
     let rest = &rest[1..];
     let end = rest.find('"')?;
     Some(rest[..end].to_string())
-}
-
-/// Acquire a Managed Identity token for Azure Storage.
-/// On Azure Functions, uses IDENTITY_ENDPOINT + IDENTITY_HEADER.
-/// Locally, falls back to `az account get-access-token`.
-fn get_access_token() -> Option<String> {
-    // Check cache first
-    {
-        let cache = TOKEN_CACHE.lock().ok()?;
-        if let Some(cached) = cache.as_ref() {
-            // Refresh if within 5 minutes of expiry
-            let elapsed = cached.acquired_at.elapsed().as_secs();
-            if elapsed + 300 < cached.expires_in {
-                return Some(cached.token.clone());
-            }
-        }
-    }
-
-    let token_info = get_fresh_token()?;
-
-    // Cache it
-    if let Ok(mut cache) = TOKEN_CACHE.lock() {
-        *cache = Some(token_info);
-    }
-
-    TOKEN_CACHE
-        .lock()
-        .ok()
-        .and_then(|c| c.as_ref().map(|t| t.token.clone()))
-}
-
-fn get_fresh_token() -> Option<CachedToken> {
-    let identity_endpoint = env::var("IDENTITY_ENDPOINT").ok();
-    let identity_header = env::var("IDENTITY_HEADER").ok();
-
-    let body = match (identity_endpoint, identity_header) {
-        (Some(endpoint), Some(header)) => {
-            // Running on Azure Functions
-            let url = format!(
-                "{}?api-version=2019-08-01&resource=https://storage.azure.com/",
-                endpoint
-            );
-            let resp = ureq::get(&url)
-                .header("X-IDENTITY-HEADER", &header)
-                .call()
-                .ok()?;
-            resp.into_body().read_to_string().ok()?
-        }
-        _ => {
-            // Local dev — try Azure CLI
-            //track("No Managed Identity available, trying az cli...", SEV_INFO);
-            let output = std::process::Command::new("az")
-                .args([
-                    "account",
-                    "get-access-token",
-                    "--resource",
-                    "https://storage.azure.com/",
-                    "--output",
-                    "json",
-                ])
-                .output()
-                .ok()?;
-            if !output.status.success() {
-                return None;
-            }
-            String::from_utf8(output.stdout).ok()?
-        }
-    };
-
-    let token = extract_json_string(&body, "access_token")?;
-    let expires_in = extract_json_string(&body, "expires_in")
-        .or_else(|| extract_json_string(&body, "expires_on").map(|_| "3600".to_string()))
-        .and_then(|s| s.parse::<u64>().ok())
-        .unwrap_or(3600);
-
-    Some(CachedToken {
-        token,
-        acquired_at: Instant::now(),
-        expires_in,
-    })
-}
-
-/// Check whether a 6-digit linking code exists and has not expired.
-/// Returns the user_id from the linking code row if valid.
-fn validate_link_code(code: &str, account: &str, token: &str) -> Option<String> {
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or(Duration::from_secs(0))
-        .as_secs();
-
-    let url = format!(
-        "https://{}.table.core.windows.net/linkingcodes(PartitionKey='link_code',RowKey='{}')",
-        account, code
-    );
-
-    let resp = match ureq::get(&url)
-        .header("Authorization", &format!("Bearer {}", token))
-        .header("Accept", "application/json;odata=nometadata")
-        .header("x-ms-version", "2019-02-02")
-        .call()
-    {
-        Ok(r) => r,
-        Err(e) => {
-            info!("Link code lookup failed for '{code}': {e}");
-            return None;
-        }
-    };
-
-    let body = match resp.into_body().read_to_string() {
-        Ok(b) => b,
-        Err(_) => return None,
-    };
-
-    // expires_at is stored as Edm.Int64; the JSON value may be a string or number
-    let expires_at: u64 = extract_json_string(&body, "expires_at")
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(0);
-
-    if expires_at <= now {
-        info!("Link code '{code}' has expired");
-        return None;
-    }
-
-    let user_id = match extract_json_string(&body, "user_id") {
-        Some(id) => id,
-        None => {
-            warn!("Link code '{code}' missing user_id");
-            return None;
-        }
-    };
-
-    info!("Link code '{code}' is valid, user_id: {user_id}");
-    Some(user_id)
-}
-
-/// Store a nonce in Azure Table Storage with a 5-minute expiry.
-fn store_nonce(nonce: &str, linking_session: bool, user_id: &str) {
-    let account = match env::var("STORAGE_ACCOUNT_NAME") {
-        Ok(a) => a,
-        Err(_) => {
-            warn!("STORAGE_ACCOUNT_NAME not set, skipping nonce storage");
-            return;
-        }
-    };
-
-    let token = match get_access_token() {
-        Some(t) => t,
-        None => {
-            error!("Could not acquire access token, skipping nonce storage");
-            return;
-        }
-    };
-
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or(Duration::from_secs(0));
-    let created_at = now.as_secs();
-    let expires_at = created_at + 300; // 5 minutes
-
-    let url = format!("https://{}.table.core.windows.net/nonces", account);
-    let body = format!(
-        r#"{{"PartitionKey": "nonce", "RowKey": "{nonce}", "user_id": "{user_id}", "linking_session": {linking_session}, "created_at": "{created_at}", "expires_at": "{expires_at}"}}"#
-    );
-
-    match ureq::post(&url)
-        .header("Authorization", &format!("Bearer {}", token))
-        .header("Content-Type", "application/json")
-        .header("Accept", "application/json;odata=nometadata")
-        .header("x-ms-version", "2019-02-02")
-        .header("Prefer", "return-no-content")
-        .send(body.as_bytes())
-    {
-        Ok(_) => info!("Nonce stored: {nonce}"),
-        Err(e) => error!("Failed to store nonce: {e}"),
-    }
 }
 
 
@@ -336,23 +156,44 @@ fn validate_jwt(jwt: &str) -> Result<Claims, String> {
     Ok(token_data.claims)
 }
 
-fn get_nonce(query: &str) -> (&'static str, String) {
-    let nonce = generate_nonce();
+fn validate_link_code(code: &str) -> Option<String> {
+    let body = match table::take("linkingcodes", "link_code", code) {
+        Ok(b) => b,
+        Err(e) => {
+            info!("Link code lookup failed for '{code}': {e}");
+            return None;
+        }
+    };
 
-    // Check for a link_code query parameter (6 digits)
-    let link_code = query
+    let user_id = match extract_json_string(&body, "user_id") {
+        Some(id) => id,
+        None => {
+            warn!("Link code '{code}' missing user_id");
+            return None;
+        }
+    };
+
+    info!("Link code '{code}' is valid, user_id: {user_id}");
+    Some(user_id)
+}
+
+fn get_nonce(query: &str) -> (&'static str, String) {
+    let nonce = random_hex(32);
+
+    let raw_link_code = query
         .split('&')
         .filter_map(|p| p.strip_prefix("link_code="))
-        .next()
-        .filter(|c| c.len() == 6 && c.chars().all(|ch| ch.is_ascii_digit()));
+        .next();
 
-    let link_user_id = if let Some(code) = link_code {
-        let account = env::var("STORAGE_ACCOUNT_NAME").unwrap_or_default();
-        match get_access_token() {
-            Some(token) => validate_link_code(code, &account, &token),
+    let link_user_id = if let Some(code) = raw_link_code {
+        if code.len() != 6 || !code.chars().all(|ch| ch.is_ascii_digit()) {
+            warn!("Malformed link code: {code}");
+            return ("400 Bad Request", "invalid link code".to_string());
+        }
+        match validate_link_code(code) {
+            Some(user_id) => Some(user_id),
             None => {
-                error!("Could not acquire token to validate link code");
-                None
+                return ("400 Bad Request", "invalid link code".to_string());
             }
         }
     } else {
@@ -361,7 +202,16 @@ fn get_nonce(query: &str) -> (&'static str, String) {
 
     let linking_session = link_user_id.is_some();
     let user_id = link_user_id.as_deref().unwrap_or("");
-    store_nonce(&nonce, linking_session, user_id);
+
+    match table::insert(
+        "nonces", "nonce", &nonce,
+        &format!(r#""user_id": "{user_id}", "linking_session": {linking_session}"#),
+        Some(300),
+    ) {
+        Ok(_) => info!("Nonce stored: {nonce}"),
+        Err(e) => error!("Failed to store nonce: {e}"),
+    }
+
     ("200 OK", nonce)
 }
 
@@ -374,7 +224,6 @@ fn get_token(jwt: &str) -> (&'static str, String) {
         return ("400 Bad Request", "missing token".to_string());
     }
 
-    // Validate the JWT signature and claims
     let claims = match validate_jwt(jwt) {
         Ok(c) => c,
         Err(e) => {
@@ -393,81 +242,20 @@ fn get_token(jwt: &str) -> (&'static str, String) {
 
     info!("Token requested with nonce: {nonce}, sub: {:?}", claims.sub);
 
-    // Verify the nonce exists in Table Storage
-    let account = match env::var("STORAGE_ACCOUNT_NAME") {
-        Ok(a) => a,
-        Err(_) => {
-            error!("STORAGE_ACCOUNT_NAME not set");
-            return ("500 Internal Server Error", "internal error".to_string());
+    // Fetch and delete the nonce
+    let nonce_body = match table::take("nonces", "nonce", &nonce) {
+        Ok(b) => b,
+        Err(TableError::NotFound) => {
+            warn!("Nonce not found or expired: {nonce}");
+            return ("401 Unauthorized", "unauthorized".to_string());
         }
-    };
-
-    let token = match get_access_token() {
-        Some(t) => t,
-        None => {
-            error!("Could not acquire access token for nonce lookup");
-            return ("500 Internal Server Error", "internal error".to_string());
-        }
-    };
-
-    let url = format!(
-        "https://{}.table.core.windows.net/nonces(PartitionKey='nonce',RowKey='{}')",
-        account, nonce
-    );
-
-    // Fetch the nonce row to check expiry
-    let nonce_body = match ureq::get(&url)
-        .header("Authorization", &format!("Bearer {}", token))
-        .header("Accept", "application/json;odata=nometadata")
-        .header("x-ms-version", "2019-02-02")
-        .call()
-    {
-        Ok(resp) => match resp.into_body().read_to_string() {
-            Ok(b) => b,
-            Err(e) => {
-                error!("Failed to read nonce response: {e}");
-                return ("500 Internal Server Error", "internal error".to_string());
-            }
-        },
         Err(e) => {
-            warn!("Nonce not found in storage: {e}");
-            return ("401 Unauthorized", "invalid nonce".to_string());
+            error!("Nonce lookup failed: {e}");
+            return ("500 Internal Server Error", "internal error".to_string());
         }
     };
 
-    // Delete the nonce now that it's been used
-    match ureq::delete(&url)
-        .header("Authorization", &format!("Bearer {}", token))
-        .header("If-Match", "*")
-        .header("x-ms-version", "2019-02-02")
-        .call()
-    {
-        Ok(_) => info!("Nonce deleted: {nonce}"),
-        Err(e) => warn!("Failed to delete nonce: {e}"),
-    }
-
-    // Check if the nonce is expired
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or(Duration::from_secs(0))
-        .as_secs();
-
-    let expires_at = match extract_json_string(&nonce_body, "expires_at")
-        .and_then(|s| s.parse::<u64>().ok())
-    {
-        Some(e) => e,
-        None => {
-            warn!("Nonce row missing expires_at");
-            return ("401 Unauthorized", "invalid nonce".to_string());
-        }
-    };
-
-    if now >= expires_at {
-        warn!("Nonce expired: {nonce}");
-        return ("401 Unauthorized", "nonce expired".to_string());
-    }
-
-    info!("Nonce verified and not expired: {nonce}");
+    info!("Nonce verified: {nonce}");
 
     let sub = match claims.sub {
         Some(s) => s,
@@ -477,59 +265,39 @@ fn get_token(jwt: &str) -> (&'static str, String) {
         }
     };
 
-    // Get user_id from the nonce row (non-empty means linking session)
+    // Resolve user_id: linking session or existing account lookup
     let nonce_user_id = extract_json_string(&nonce_body, "user_id")
         .unwrap_or_default();
 
     let user_id = if !nonce_user_id.is_empty() {
-        // Linking session — insert a row into linkedaccounts
-        let created_at = now;
-        let link_body = format!(
-            r#"{{"PartitionKey": "linked_accounts", "RowKey": "{sub}", "account_provider": "microsoft", "user_id": "{nonce_user_id}", "created_at": "{created_at}"}}"#
-        );
-        let link_url = format!("https://{}.table.core.windows.net/linkedaccounts", account);
-        match ureq::post(&link_url)
-            .header("Authorization", &format!("Bearer {}", token))
-            .header("Content-Type", "application/json")
-            .header("Accept", "application/json;odata=nometadata")
-            .header("x-ms-version", "2019-02-02")
-            .header("Prefer", "return-no-content")
-            .send(link_body.as_bytes())
-        {
+        // Linking session — create linked account
+        match table::insert(
+            "linkedaccounts", "linked_accounts", &sub,
+            &format!(r#""account_provider": "microsoft", "user_id": "{nonce_user_id}""#),
+            None,
+        ) {
             Ok(_) => info!("Linked account created: sub={sub}, user_id={nonce_user_id}"),
+            Err(TableError::Conflict) => {
+                warn!("Linked account already exists: sub={sub}");
+                return ("401 Unauthorized", "unauthorized".to_string());
+            }
             Err(e) => {
-                let msg = e.to_string();
-                if msg.contains("409") {
-                    warn!("Linked account already exists: sub={sub}");
-                    return ("400 Bad Request", "account already linked".to_string());
-                }
                 error!("Failed to create linked account: {e}");
                 return ("500 Internal Server Error", "internal error".to_string());
             }
         }
         nonce_user_id
     } else {
-        // Not a linking session — look up user_id from linkedaccounts via sub
-        let lookup_url = format!(
-            "https://{}.table.core.windows.net/linkedaccounts(PartitionKey='linked_accounts',RowKey='{}')",
-            account, sub
-        );
-        let lookup_body = match ureq::get(&lookup_url)
-            .header("Authorization", &format!("Bearer {}", token))
-            .header("Accept", "application/json;odata=nometadata")
-            .header("x-ms-version", "2019-02-02")
-            .call()
-        {
-            Ok(resp) => match resp.into_body().read_to_string() {
-                Ok(b) => b,
-                Err(e) => {
-                    error!("Failed to read linked account response: {e}");
-                    return ("500 Internal Server Error", "internal error".to_string());
-                }
-            },
+        // Look up existing linked account
+        let lookup_body = match table::get("linkedaccounts", "linked_accounts", &sub) {
+            Ok(b) => b,
+            Err(TableError::NotFound) => {
+                warn!("No linked account for sub={sub}");
+                return ("401 Unauthorized", "unauthorized".to_string());
+            }
             Err(e) => {
-                warn!("No linked account found for sub={sub}: {e}");
-                return ("401 Unauthorized", "account not linked".to_string());
+                error!("Linked account lookup failed: {e}");
+                return ("500 Internal Server Error", "internal error".to_string());
             }
         };
         match extract_json_string(&lookup_body, "user_id") {
@@ -541,27 +309,13 @@ fn get_token(jwt: &str) -> (&'static str, String) {
         }
     };
 
-    // Generate a 128-char refresh token
-    let mut rng = rand::rng();
-    let refresh_token: String = (0..64)
-        .map(|_| format!("{:02x}", rng.random::<u8>()))
-        .collect();
-
-    // Store session in Table Storage
-    let session_url = format!("https://{}.table.core.windows.net/sessions", account);
-    let expires_at = now + 86400; // 1 day
-    let session_body = format!(
-        r#"{{"PartitionKey": "sessions", "RowKey": "{refresh_token}", "user_id": "{user_id}", "created_at": "{now}", "expires_at": "{expires_at}"}}"#
-    );
-
-    match ureq::post(&session_url)
-        .header("Authorization", &format!("Bearer {}", token))
-        .header("Content-Type", "application/json")
-        .header("Accept", "application/json;odata=nometadata")
-        .header("x-ms-version", "2019-02-02")
-        .header("Prefer", "return-no-content")
-        .send(session_body.as_bytes())
-    {
+    // Create session
+    let refresh_token = random_hex(64);
+    match table::insert(
+        "sessions", "sessions", &refresh_token,
+        &format!(r#""user_id": "{user_id}""#),
+        Some(86400),
+    ) {
         Ok(_) => info!("Session created for user {user_id}"),
         Err(e) => {
             error!("Failed to create session: {e}");
@@ -796,14 +550,6 @@ fn get_url(body: &str) -> (&'static str, String) {
         return ("400 Bad Request", "missing refresh token".to_string());
     }
 
-    let account = match env::var("STORAGE_ACCOUNT_NAME") {
-        Ok(a) => a,
-        Err(_) => {
-            error!("STORAGE_ACCOUNT_NAME not set");
-            return ("500 Internal Server Error", "internal error".to_string());
-        }
-    };
-
     let user_account = match env::var("USER_STORAGE_ACCOUNT_NAME") {
         Ok(a) => a,
         Err(_) => {
@@ -812,59 +558,18 @@ fn get_url(body: &str) -> (&'static str, String) {
         }
     };
 
-    let token = match get_access_token() {
-        Some(t) => t,
-        None => {
-            error!("Could not acquire access token");
+    // Fetch and delete the old session
+    let session_body = match table::take("sessions", "sessions", refresh_token) {
+        Ok(b) => b,
+        Err(TableError::NotFound) => {
+            warn!("Session not found or expired");
+            return ("401 Unauthorized", "invalid session".to_string());
+        }
+        Err(e) => {
+            error!("Session lookup failed: {e}");
             return ("500 Internal Server Error", "internal error".to_string());
         }
     };
-
-    // Look up the session
-    let url = format!(
-        "https://{}.table.core.windows.net/sessions(PartitionKey='sessions',RowKey='{}')",
-        account, refresh_token
-    );
-
-    let session_body = match ureq::get(&url)
-        .header("Authorization", &format!("Bearer {}", token))
-        .header("Accept", "application/json;odata=nometadata")
-        .header("x-ms-version", "2019-02-02")
-        .call()
-    {
-        Ok(resp) => match resp.into_body().read_to_string() {
-            Ok(b) => b,
-            Err(e) => {
-                error!("Failed to read session response: {e}");
-                return ("500 Internal Server Error", "internal error".to_string());
-            }
-        },
-        Err(e) => {
-            warn!("Session not found: {e}");
-            return ("401 Unauthorized", "invalid session".to_string());
-        }
-    };
-
-    // Check expiry
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or(Duration::from_secs(0))
-        .as_secs();
-
-    let expires_at = match extract_json_string(&session_body, "expires_at")
-        .and_then(|s| s.parse::<u64>().ok())
-    {
-        Some(e) => e,
-        None => {
-            warn!("Session row missing expires_at");
-            return ("401 Unauthorized", "invalid session".to_string());
-        }
-    };
-
-    if now >= expires_at {
-        warn!("Session expired for token");
-        return ("401 Unauthorized", "session expired".to_string());
-    }
 
     let user_id = match extract_json_string(&session_body, "user_id") {
         Some(id) => id,
@@ -874,38 +579,13 @@ fn get_url(body: &str) -> (&'static str, String) {
         }
     };
 
-    // Delete the old session
-    match ureq::delete(&url)
-        .header("Authorization", &format!("Bearer {}", token))
-        .header("If-Match", "*")
-        .header("x-ms-version", "2019-02-02")
-        .call()
-    {
-        Ok(_) => info!("Old session deleted"),
-        Err(e) => warn!("Failed to delete old session: {e}"),
-    }
-
-    // Generate a new refresh token
-    let mut rng = rand::rng();
-    let new_refresh_token: String = (0..64)
-        .map(|_| format!("{:02x}", rng.random::<u8>()))
-        .collect();
-
-    // Store new session
-    let session_url = format!("https://{}.table.core.windows.net/sessions", account);
-    let new_expires_at = now + 86400; // 1 day
-    let new_session_body = format!(
-        r#"{{"PartitionKey": "sessions", "RowKey": "{new_refresh_token}", "user_id": "{user_id}", "created_at": "{now}", "expires_at": "{new_expires_at}"}}"#
-    );
-
-    match ureq::post(&session_url)
-        .header("Authorization", &format!("Bearer {}", token))
-        .header("Content-Type", "application/json")
-        .header("Accept", "application/json;odata=nometadata")
-        .header("x-ms-version", "2019-02-02")
-        .header("Prefer", "return-no-content")
-        .send(new_session_body.as_bytes())
-    {
+    // Create new session
+    let new_refresh_token = random_hex(64);
+    match table::insert(
+        "sessions", "sessions", &new_refresh_token,
+        &format!(r#""user_id": "{user_id}""#),
+        Some(86400),
+    ) {
         Ok(_) => info!("New session created for user {user_id}"),
         Err(e) => {
             error!("Failed to create new session: {e}");
@@ -914,6 +594,14 @@ fn get_url(body: &str) -> (&'static str, String) {
     }
 
     // Generate SAS URL for user's blob container
+    let token = match table::get_storage_token() {
+        Ok(t) => t,
+        Err(e) => {
+            error!("Could not acquire access token for blob storage: {e}");
+            return ("500 Internal Server Error", "internal error".to_string());
+        }
+    };
+
     let container = user_id.to_lowercase();
 
     if !ensure_user_container(&user_account, &token, &container) {
