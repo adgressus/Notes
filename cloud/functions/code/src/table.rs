@@ -1,9 +1,10 @@
 use std::env;
 use std::fmt;
-use std::sync::Mutex;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use log::{debug, warn};
+
+use crate::util;
 
 // ─── Error type ────────────────────────────────────────────────
 
@@ -27,99 +28,6 @@ impl fmt::Display for TableError {
             TableError::HttpError(code) => write!(f, "HTTP {code}"),
         }
     }
-}
-
-// ─── Token cache ───────────────────────────────────────────────
-
-struct CachedToken {
-    token: String,
-    acquired_at: Instant,
-    expires_in: u64,
-}
-
-static TOKEN_CACHE: Mutex<Option<CachedToken>> = Mutex::new(None);
-
-fn get_access_token() -> Result<String, TableError> {
-    {
-        let cache = TOKEN_CACHE.lock()
-            .map_err(|e| TableError::NotConfigured(format!("lock failed: {e}")))?;
-        if let Some(cached) = cache.as_ref() {
-            let elapsed = cached.acquired_at.elapsed().as_secs();
-            if elapsed + 300 < cached.expires_in {
-                return Ok(cached.token.clone());
-            }
-        }
-    }
-
-    let token_info = get_fresh_token()?;
-
-    if let Ok(mut cache) = TOKEN_CACHE.lock() {
-        *cache = Some(token_info);
-    }
-
-    TOKEN_CACHE
-        .lock()
-        .map_err(|e| TableError::NotConfigured(format!("lock failed: {e}")))?
-        .as_ref()
-        .map(|t| t.token.clone())
-        .ok_or_else(|| TableError::NotConfigured("token cache empty after store".into()))
-}
-
-fn get_fresh_token() -> Result<CachedToken, TableError> {
-    let identity_endpoint = env::var("IDENTITY_ENDPOINT").ok();
-    let identity_header = env::var("IDENTITY_HEADER").ok();
-
-    let body = match (identity_endpoint, identity_header) {
-        (Some(endpoint), Some(header)) => {
-            let url = format!(
-                "{}?api-version=2019-08-01&resource=https://storage.azure.com/",
-                endpoint
-            );
-            let resp = ureq::get(&url)
-                .header("X-IDENTITY-HEADER", &header)
-                .call()
-                .map_err(|e| TableError::ConnectionError(format!("identity request: {e}")))?;
-            resp.into_body().read_to_string()
-                .map_err(|e| TableError::BadResponse(format!("identity response: {e}")))?
-        }
-        _ => {
-            let output = std::process::Command::new("az")
-                .args(["account", "get-access-token", "--resource",
-                       "https://storage.azure.com/", "--output", "json"])
-                .output()
-                .map_err(|e| TableError::NotConfigured(format!("az cli: {e}")))?;
-            if !output.status.success() {
-                return Err(TableError::NotConfigured("az cli returned non-zero".into()));
-            }
-            String::from_utf8(output.stdout)
-                .map_err(|e| TableError::BadResponse(format!("az cli output: {e}")))?
-        }
-    };
-
-    let token = extract_json_string(&body, "access_token")
-        .ok_or_else(|| TableError::BadResponse("missing access_token".into()))?;
-    let expires_in = extract_json_string(&body, "expires_in")
-        .or_else(|| extract_json_string(&body, "expires_on").map(|_| "3600".to_string()))
-        .and_then(|s| s.parse::<u64>().ok())
-        .unwrap_or(3600);
-
-    Ok(CachedToken {
-        token,
-        acquired_at: Instant::now(),
-        expires_in,
-    })
-}
-
-fn extract_json_string(json: &str, key: &str) -> Option<String> {
-    let pattern = format!(r#""{}":"#, key);
-    let start = json.find(&pattern)? + pattern.len();
-    let rest = json[start..].trim_start();
-    if !rest.starts_with('"') {
-        return None;
-    }
-    let rest = &rest[1..];
-    let end = rest.find('"')?;
-    Some(rest[..end].to_string())
 }
 
 // ─── Internal helpers ──────────────────────────────────────────
@@ -168,7 +76,7 @@ fn classify_error(e: ureq::Error) -> TableError {
 }
 
 fn is_expired(body: &str) -> bool {
-    extract_json_string(body, "expires_at")
+    util::extract_json_string(body, "expires_at")
         .and_then(|s| s.parse::<u64>().ok())
         .is_some_and(|exp| now_epoch_secs() >= exp)
 }
@@ -187,11 +95,6 @@ fn best_effort_delete(url: &str, token: &str, table: &str, partition_key: &str, 
 
 // ─── Public API ────────────────────────────────────────────────
 
-/// Expose the cached access token for use by other storage operations (e.g. blob).
-pub fn get_storage_token() -> Result<String, TableError> {
-    get_access_token()
-}
-
 /// Read a single entity from a table. Returns NotFound if the row is expired.
 pub fn get(
     table: &str,
@@ -199,7 +102,8 @@ pub fn get(
     row_key: &str,
 ) -> Result<String, TableError> {
     let account = account()?;
-    let token = get_access_token()?;
+    let token = util::get_storage_token()
+        .map_err(|e| TableError::NotConfigured(format!("{e}")))?;
     let url = entity_url(&account, table, partition_key, row_key);
 
     let resp = ureq::get(&url)
@@ -229,7 +133,8 @@ pub fn take(
     row_key: &str,
 ) -> Result<String, TableError> {
     let account = account()?;
-    let token = get_access_token()?;
+    let token = util::get_storage_token()
+        .map_err(|e| TableError::NotConfigured(format!("{e}")))?;
     let url = entity_url(&account, table, partition_key, row_key);
 
     let resp = ureq::get(&url)
@@ -263,7 +168,8 @@ pub fn insert(
     expiry_secs: Option<u64>,
 ) -> Result<(), TableError> {
     let account = account()?;
-    let token = get_access_token()?;
+    let token = util::get_storage_token()
+        .map_err(|e| TableError::NotConfigured(format!("{e}")))?;
     let now = now_epoch_secs();
 
     let expiry_field = match expiry_secs {

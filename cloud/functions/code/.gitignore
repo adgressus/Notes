@@ -12,3 +12,4 @@ __azurite_db*__.json
 
 # Rust artifacts
 target/
+handler

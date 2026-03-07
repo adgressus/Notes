@@ -1,20 +1,21 @@
+mod blob;
 mod table;
+mod util;
 
 use std::env;
 use std::io::{BufRead, BufReader, Write};
 use std::net::TcpListener;
 use std::sync::Mutex;
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
-use base64::Engine;
-use hmac::{Hmac, Mac};
 use jsonwebtoken::{decode, decode_header, Algorithm, DecodingKey, Validation};
 use log::{info, warn, error, LevelFilter, Log, Metadata, Record};
 use rand::RngExt;
 use serde::Deserialize;
-use sha2::Sha256;
 
 use table::TableError;
+
+// ─── JWT validation ─────────────────────────────────────────────
 
 static JWKS_CACHE: Mutex<Option<CachedJwks>> = Mutex::new(None);
 
@@ -41,16 +42,6 @@ struct CachedJwks {
     fetched_at: Instant,
 }
 
-struct UserDelegationKey {
-    signed_oid: String,
-    signed_tid: String,
-    signed_start: String,
-    signed_expiry: String,
-    signed_service: String,
-    signed_version: String,
-    value: String,
-}
-
 struct ConsoleLogger;
 
 impl Log for ConsoleLogger {
@@ -74,18 +65,6 @@ fn random_hex(bytes: usize) -> String {
     (0..bytes)
         .map(|_| format!("{:02x}", rng.random::<u8>()))
         .collect()
-}
-
-fn extract_json_string(json: &str, key: &str) -> Option<String> {
-    let pattern = format!(r#""{}":"#, key);
-    let start = json.find(&pattern)? + pattern.len();
-    let rest = json[start..].trim_start();
-    if !rest.starts_with('"') {
-        return None;
-    }
-    let rest = &rest[1..];
-    let end = rest.find('"')?;
-    Some(rest[..end].to_string())
 }
 
 
@@ -156,6 +135,8 @@ fn validate_jwt(jwt: &str) -> Result<Claims, String> {
     Ok(token_data.claims)
 }
 
+// ─── Handlers ──────────────────────────────────────────────────
+
 fn validate_link_code(code: &str) -> Option<String> {
     let body = match table::take("linkingcodes", "link_code", code) {
         Ok(b) => b,
@@ -165,7 +146,7 @@ fn validate_link_code(code: &str) -> Option<String> {
         }
     };
 
-    let user_id = match extract_json_string(&body, "user_id") {
+    let user_id = match util::extract_json_string(&body, "user_id") {
         Some(id) => id,
         None => {
             warn!("Link code '{code}' missing user_id");
@@ -266,7 +247,7 @@ fn get_token(jwt: &str) -> (&'static str, String) {
     };
 
     // Resolve user_id: linking session or existing account lookup
-    let nonce_user_id = extract_json_string(&nonce_body, "user_id")
+    let nonce_user_id = util::extract_json_string(&nonce_body, "user_id")
         .unwrap_or_default();
 
     let user_id = if !nonce_user_id.is_empty() {
@@ -300,7 +281,7 @@ fn get_token(jwt: &str) -> (&'static str, String) {
                 return ("500 Internal Server Error", "internal error".to_string());
             }
         };
-        match extract_json_string(&lookup_body, "user_id") {
+        match util::extract_json_string(&lookup_body, "user_id") {
             Some(id) => id,
             None => {
                 warn!("Linked account row missing user_id for sub={sub}");
@@ -326,237 +307,12 @@ fn get_token(jwt: &str) -> (&'static str, String) {
     ("200 OK", refresh_token)
 }
 
-// ─── SAS URL generation helpers ────────────────────────────────
-
-fn extract_xml_value(xml: &str, tag: &str) -> Option<String> {
-    let open = format!("<{}>", tag);
-    let close = format!("</{}>", tag);
-    let start = xml.find(&open)? + open.len();
-    let end = xml[start..].find(&close)? + start;
-    Some(xml[start..end].to_string())
-}
-
-fn is_leap_year(y: u64) -> bool {
-    (y % 4 == 0 && y % 100 != 0) || y % 400 == 0
-}
-
-fn days_to_ymd(days: u64) -> (u64, u64, u64) {
-    let mut y = 1970;
-    let mut remaining = days;
-    loop {
-        let diy = if is_leap_year(y) { 366 } else { 365 };
-        if remaining < diy {
-            break;
-        }
-        remaining -= diy;
-        y += 1;
-    }
-    let dim = if is_leap_year(y) {
-        [31, 29, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31]
-    } else {
-        [31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31]
-    };
-    let mut m = 0;
-    for &d in &dim {
-        if remaining < d {
-            break;
-        }
-        remaining -= d;
-        m += 1;
-    }
-    (y, m + 1, remaining + 1)
-}
-
-fn format_iso8601(epoch_secs: u64) -> String {
-    let days = epoch_secs / 86400;
-    let time = epoch_secs % 86400;
-    let (year, month, day) = days_to_ymd(days);
-    let hours = time / 3600;
-    let minutes = (time % 3600) / 60;
-    let seconds = time % 60;
-    format!("{year:04}-{month:02}-{day:02}T{hours:02}:{minutes:02}:{seconds:02}Z")
-}
-
-fn url_encode(s: &str) -> String {
-    let mut out = String::with_capacity(s.len() * 3);
-    for b in s.bytes() {
-        match b {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
-                out.push(b as char);
-            }
-            _ => {
-                out.push_str(&format!("%{:02X}", b));
-            }
-        }
-    }
-    out
-}
-
-/// Obtain a user delegation key from Azure Blob Storage.
-fn get_user_delegation_key(account: &str, token: &str) -> Option<UserDelegationKey> {
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or(Duration::from_secs(0))
-        .as_secs();
-    let start = format_iso8601(now);
-    let expiry = format_iso8601(now + 3600);
-
-    let url = format!(
-        "https://{}.blob.core.windows.net/?restype=service&comp=userdelegationkey",
-        account
-    );
-    let body = format!(
-        "<?xml version=\"1.0\" encoding=\"utf-8\"?>\
-         <KeyInfo>\
-         <Start>{start}</Start>\
-         <Expiry>{expiry}</Expiry>\
-         </KeyInfo>"
-    );
-
-    let resp = match ureq::post(&url)
-        .header("Authorization", &format!("Bearer {}", token))
-        .header("x-ms-version", "2022-11-02")
-        .header("Content-Type", "application/xml")
-        .send(body.as_bytes())
-    {
-        Ok(r) => r,
-        Err(e) => {
-            error!("Failed to get user delegation key: {e}");
-            return None;
-        }
-    };
-
-    let resp_body = resp.into_body().read_to_string().ok()?;
-    info!("User delegation key obtained");
-
-    Some(UserDelegationKey {
-        signed_oid: extract_xml_value(&resp_body, "SignedOid")?,
-        signed_tid: extract_xml_value(&resp_body, "SignedTid")?,
-        signed_start: extract_xml_value(&resp_body, "SignedStart")?,
-        signed_expiry: extract_xml_value(&resp_body, "SignedExpiry")?,
-        signed_service: extract_xml_value(&resp_body, "SignedService")?,
-        signed_version: extract_xml_value(&resp_body, "SignedVersion")?,
-        value: extract_xml_value(&resp_body, "Value")?,
-    })
-}
-
-/// Ensure a blob container exists, creating it if necessary.
-fn ensure_user_container(account: &str, token: &str, container: &str) -> bool {
-    let url = format!(
-        "https://{}.blob.core.windows.net/{}?restype=container",
-        account, container
-    );
-    match ureq::put(&url)
-        .header("Authorization", &format!("Bearer {}", token))
-        .header("x-ms-version", "2022-11-02")
-        .send(&[] as &[u8])
-    {
-        Ok(_) => {
-            info!("Container created: {container}");
-            true
-        }
-        Err(e) => {
-            let msg = e.to_string();
-            if msg.contains("409") {
-                info!("Container already exists: {container}");
-                true
-            } else {
-                error!("Failed to create container '{container}': {e}");
-                false
-            }
-        }
-    }
-}
-
-/// Generate a user-delegation SAS token for a blob container.
-fn generate_container_sas(
-    account: &str,
-    container: &str,
-    key: &UserDelegationKey,
-    permissions: &str,
-    expiry_secs: u64,
-) -> Option<String> {
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or(Duration::from_secs(0))
-        .as_secs();
-
-    let start = format_iso8601(now);
-    let expiry = format_iso8601(now + expiry_secs);
-    let version = "2022-11-02";
-    let resource = "c";
-    let canonical = format!("/blob/{}/{}", account, container);
-
-    // String-to-sign for user delegation SAS (version 2020-12-06+)
-    let string_to_sign = [
-        permissions,
-        &start,
-        &expiry,
-        &canonical,
-        &key.signed_oid,
-        &key.signed_tid,
-        &key.signed_start,
-        &key.signed_expiry,
-        &key.signed_service,
-        &key.signed_version,
-        "", // signedAuthorizedUserObjectId
-        "", // signedUnauthorizedUserObjectId
-        "", // signedCorrelationId
-        "", // signedIP
-        "https",
-        version,
-        resource,
-        "", // signedSnapshotTime
-        "", // signedEncryptionScope
-        "", // rscc
-        "", // rscd
-        "", // rsce
-        "", // rscl
-        "", // rsct
-    ]
-    .join("\n");
-
-    let key_bytes = base64::engine::general_purpose::STANDARD
-        .decode(&key.value)
-        .ok()?;
-
-    type HmacSha256 = Hmac<Sha256>;
-    let mut mac = HmacSha256::new_from_slice(&key_bytes).ok()?;
-    mac.update(string_to_sign.as_bytes());
-    let signature = base64::engine::general_purpose::STANDARD
-        .encode(mac.finalize().into_bytes());
-
-    Some(format!(
-        "sv={}&sr={}&sp={}&st={}&se={}&spr=https&skoid={}&sktid={}&skt={}&ske={}&sks={}&skv={}&sig={}",
-        version,
-        resource,
-        permissions,
-        url_encode(&start),
-        url_encode(&expiry),
-        url_encode(&key.signed_oid),
-        url_encode(&key.signed_tid),
-        url_encode(&key.signed_start),
-        url_encode(&key.signed_expiry),
-        url_encode(&key.signed_service),
-        url_encode(&key.signed_version),
-        url_encode(&signature),
-    ))
-}
-
 fn get_url(body: &str) -> (&'static str, String) {
     let refresh_token = body.trim();
     if refresh_token.is_empty() {
         warn!("get_url: empty body");
         return ("400 Bad Request", "missing refresh token".to_string());
     }
-
-    let user_account = match env::var("USER_STORAGE_ACCOUNT_NAME") {
-        Ok(a) => a,
-        Err(_) => {
-            error!("USER_STORAGE_ACCOUNT_NAME not set");
-            return ("500 Internal Server Error", "internal error".to_string());
-        }
-    };
 
     // Fetch and delete the old session
     let session_body = match table::take("sessions", "sessions", refresh_token) {
@@ -571,7 +327,7 @@ fn get_url(body: &str) -> (&'static str, String) {
         }
     };
 
-    let user_id = match extract_json_string(&session_body, "user_id") {
+    let user_id = match util::extract_json_string(&session_body, "user_id") {
         Some(id) => id,
         None => {
             warn!("Session row missing user_id");
@@ -593,49 +349,24 @@ fn get_url(body: &str) -> (&'static str, String) {
         }
     }
 
-    // Generate SAS URL for user's blob container
-    let token = match table::get_storage_token() {
-        Ok(t) => t,
-        Err(e) => {
-            error!("Could not acquire access token for blob storage: {e}");
-            return ("500 Internal Server Error", "internal error".to_string());
-        }
-    };
-
+    // Retrieve temporary URL for user's blob container
     let container = user_id.to_lowercase();
 
-    if !ensure_user_container(&user_account, &token, &container) {
-        return ("500 Internal Server Error", "failed to create storage container".to_string());
-    }
-
-    let delegation_key = match get_user_delegation_key(&user_account, &token) {
-        Some(k) => k,
-        None => {
-            error!("Failed to get user delegation key");
+    let sas_url = match blob::get_container_url(&container) {
+        Ok(url) => url,
+        Err(e) => {
+            error!("Failed to retrieve temporary URL: {e}");
             return ("500 Internal Server Error", "internal error".to_string());
         }
     };
-
-    let sas_token = match generate_container_sas(
-        &user_account, &container, &delegation_key, "racwdl", 3600,
-    ) {
-        Some(s) => s,
-        None => {
-            error!("Failed to generate SAS token");
-            return ("500 Internal Server Error", "internal error".to_string());
-        }
-    };
-
-    let sas_url = format!(
-        "https://{}.blob.core.windows.net/{}?{}",
-        user_account, container, sas_token
-    );
 
     let response_body = format!(
         r#"{{"refresh_token":"{new_refresh_token}","url":"{sas_url}"}}"#
     );
     ("200 OK", response_body)
 }
+
+// ─── Router ────────────────────────────────────────────────────
 
 fn main() {
     log::set_logger(&LOGGER).unwrap();
