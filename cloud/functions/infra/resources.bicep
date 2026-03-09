@@ -9,8 +9,6 @@ param logAnalyticsName string
 param appInsightsName string
 param deploymentContainerName string
 param userBlobContainerName string
-param azureTenantId string
-param azureClientId string
 
 // ─── Storage Account ─────────────────────────────────────────
 
@@ -193,14 +191,6 @@ resource functionApp 'Microsoft.Web/sites@2024-04-01' = {
         {
           name: 'USER_STORAGE_ACCOUNT_NAME'
           value: userStorageAccount.name
-        }
-        {
-          name: 'AZURE_TENANT_ID'
-          value: azureTenantId
-        }
-        {
-          name: 'AZURE_CLIENT_ID'
-          value: azureClientId
         }
       ]
     }

@@ -22,11 +22,7 @@ var appInsightsName = '${baseName}-auth-insights'
 var deploymentContainerName = 'deployments'
 var userBlobContainerName = 'notes-user-storage'
 
-@description('Azure AD tenant ID for JWT validation')
-param azureTenantId string
 
-@description('Azure AD client ID (app registration) for JWT validation')
-param azureClientId string
 
 // ─── Resource Group ──────────────────────────────────────────
 
@@ -50,8 +46,6 @@ module resources 'resources.bicep' = {
     appInsightsName: appInsightsName
     deploymentContainerName: deploymentContainerName
     userBlobContainerName: userBlobContainerName
-    azureTenantId: azureTenantId
-    azureClientId: azureClientId
   }
 }
 

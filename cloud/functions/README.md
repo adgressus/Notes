@@ -27,9 +27,11 @@ traces
     | order by timestamp desc
 ```
 
-### Debuging notes
-- Functions compiled for the wrong platform (rust target) fail siliently in a Azure Function (they don't start so all the logging is from the worker process)
-- default api path is api/[foldername]
+### Components
+- Function currently has 2 true components and a util module:
+  - `table.rs` communicates with serverless noSQL table
+  - `blob.rs` creates user storage if needed, otherwise generates url for storage access
+  - `util.rs` holds storage access token logic for the other two modules and other utilities
 
 ### Logging
 - stdout will be ignored, log to stderr
@@ -43,6 +45,10 @@ traces
     | project timestamp, message, operation_Name, customDimensions
     | order by timestamp desc
 ```
+
+### Debuging notes
+- Functions compiled for the wrong platform (rust target) fail siliently in a Azure Function (they don't start so all the logging is from the worker process)
+- default api path is api/[foldername]
 
 ### If this was a 'real' project:
 - you might be using something other than rand for token generation since it doesn't make any prommises about being a crypto library

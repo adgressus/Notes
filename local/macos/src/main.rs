@@ -7,7 +7,7 @@ use std::sync::Mutex;
 
 use objc2::rc::Retained;
 use objc2::runtime::{AnyObject, ProtocolObject};
-use objc2::{define_class, msg_send, sel, DefinedClass, MainThreadOnly};
+use objc2::{define_class, msg_send, sel, AnyThread, DefinedClass, MainThreadOnly};
 use objc2_app_kit::{
     NSApplication, NSApplicationActivationPolicy, NSApplicationDelegate,
     NSAutoresizingMaskOptions, NSBackingStoreType, NSTextView, NSScrollView, NSBorderType, NSWindow,
@@ -18,21 +18,18 @@ use objc2_app_kit::{
 };
 use objc2_authentication_services::{
     ASAuthorizationAppleIDButton, ASAuthorizationAppleIDButtonStyle, ASAuthorizationAppleIDButtonType,
+    ASAuthorizationAppleIDProvider, ASAuthorizationAppleIDCredential,
+    ASAuthorizationController, ASAuthorizationControllerDelegate,
+    ASAuthorization,
 };
 use objc2_foundation::{
     ns_string, MainThreadMarker, NSNotification, NSObject, NSObjectProtocol, NSPoint, NSRect,
     NSSize, NSString, NSUserDefaults, NSDictionary, NSNumber, NSMutableArray, NSArray, NSURL,
-    NSInteger, NSTimer,
+    NSInteger, NSTimer, NSError, NSCopying,
 };
 
-// AWS + HTTP
-use aws_config;
-use aws_sdk_s3::Client as S3Client;
-// Using `aws_config::load_from_env()` to get credentials from environment/profile.
-use aws_sdk_s3::primitives::ByteStream;
-use aws_sdk_s3::presigning::PresigningConfig;
-use chrono::Utc;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+// HTTP
+use std::time::SystemTime;
 
 #[derive(Debug, Clone)]
 struct WindowState {
@@ -106,14 +103,14 @@ impl WindowState {
 fn save_window_states(mtm: MainThreadMarker) {
     let app = NSApplication::sharedApplication(mtm);
     let windows = app.windows();
-    println!("NSApplication windows count: {}", windows.count());
+    log::info!("NSApplication windows count: {}", windows.count());
     
     // Debug: print info about each window
     for (i, window) in windows.iter().enumerate() {
         let title_rust = window.title().to_string();
         let is_visible = window.isVisible();
         let has_delegate = window.delegate().is_some();
-        println!("  Window {}: title='{}', visible={}, has_delegate={}", 
+        log::info!("  Window {}: title='{}', visible={}, has_delegate={}", 
             i, title_rust, is_visible, has_delegate);
     }
     
@@ -158,7 +155,7 @@ fn save_window_states(mtm: MainThreadMarker) {
     
     // Don't overwrite existing states if we have nothing to save
     if count == 0 {
-        println!("No window states to save, preserving existing states");
+        log::info!("No window states to save, preserving existing states");
         return;
     }
     
@@ -168,7 +165,7 @@ fn save_window_states(mtm: MainThreadMarker) {
         defaults.setObject_forKey(Some(&array), ns_string!("windowStates"));
     }
     
-    println!("Saved {} window states", count);
+    log::info!("Saved {} window states", count);
 }
 
 fn load_window_states(_mtm: MainThreadMarker) -> Vec<WindowState> {
@@ -203,7 +200,7 @@ fn load_window_states(_mtm: MainThreadMarker) -> Vec<WindowState> {
     // Clear the stored states after loading (they'll be re-saved when windows close)
     defaults.removeObjectForKey(ns_string!("windowStates"));
     
-    println!("Loaded {} window states (cleared from storage)", states.len());
+    log::info!("Loaded {} window states (cleared from storage)", states.len());
     states
 }
 
@@ -263,10 +260,8 @@ fn create_window(
         PathBuf::from(filename)
     };
     
-    let bucket = std::env::var("S3_BUCKET").ok();
-    let app_delegate = get_s3_client(mtm);
-    let s3_client = app_delegate.as_ref().and_then(|d| d.ivars().s3_client.get());
-    let file_content = load_file_content(&file_path, bucket.as_deref(), s3_client);
+    let container_sas_url = get_container_sas_url(mtm);
+    let file_content = load_file_content(&file_path, container_sas_url.as_deref());
     
     let default_frame = NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(600.0, 500.0));
     let window_frame = frame.unwrap_or(default_frame);
@@ -334,10 +329,10 @@ fn create_window_from_state(state: WindowState, mtm: MainThreadMarker) {
 }
 
 fn print_error_chain(err: &dyn std::error::Error) {
-    eprintln!("error: {}", err);
+    log::error!("error: {}", err);
     let mut src = err.source();
     while let Some(s) = src {
-        eprintln!("caused by: {}", s);
+        log::error!("caused by: {}", s);
         src = s.source();
     }
 }
@@ -355,7 +350,7 @@ fn auto_save_all_windows(mtm: MainThreadMarker) {
     let app = NSApplication::sharedApplication(mtm);
     let windows = app.windows();
     
-    println!("[DEBUG] auto_save_all_windows: checking {} windows", windows.count());
+    log::debug!(" auto_save_all_windows: checking {} windows", windows.count());
     
     for window in windows.iter() {
         // Get delegate and try to downcast to our WindowDelegate type
@@ -373,41 +368,53 @@ fn auto_save_all_windows(mtm: MainThreadMarker) {
         
         // Skip if content hasn't changed
         if current_hash == last_hash {
-            println!("[DEBUG] auto_save: no changes in {} (hash match)", file_path.display());
+            log::debug!(" auto_save: no changes in {} (hash match)", file_path.display());
             continue;
         }
         
-        println!("Auto-save: changes detected in {}", file_path.display());
+        log::info!("Auto-save: changes detected in {}", file_path.display());
         
         // Save locally
         match std::fs::write(&file_path, &content) {
-            Ok(_) => println!("Auto-save: wrote to {}", file_path.display()),
+            Ok(_) => log::info!("Auto-save: wrote to {}", file_path.display()),
             Err(e) => {
-                eprintln!("Auto-save: failed to write {}: {}", file_path.display(), e);
+                log::error!("Auto-save: failed to write {}: {}", file_path.display(), e);
                 continue;
             }
         }
         
-        // Upload to S3 if configured
-        if let Ok(bucket) = std::env::var("S3_BUCKET") {
+        // Upload to Azure if configured
+        if let Some(sas_url) = get_container_sas_url(mtm) {
             let key = file_path.file_name()
                 .and_then(|os| os.to_str())
                 .unwrap_or("notes.txt")
                 .to_string();
             
-            if let Some(app_delegate) = get_s3_client(mtm) {
-                if let Some(client) = app_delegate.ivars().s3_client.get() {
-                    match s3_upload(client, &bucket, &key, content.clone().into_bytes()) {
-                        Ok(_) => {
-                            println!("Auto-save: S3 upload succeeded for s3://{}/{}", bucket, key);
-                            match s3_presign_url(client, &bucket, &key, 3600) {
-                                Ok(url) => println!("Presigned URL (1h): {}", url),
-                                Err(e) => eprintln!("Failed to generate presigned URL: {:?}", e),
+            match azure_upload(&sas_url, &key, content.clone().into_bytes()) {
+                Ok(_) => {
+                    log::info!("Auto-save: Azure upload succeeded for {}", key);
+                }
+                Err(e) => {
+                    log::error!("Auto-save: Azure upload failed: {:?}", e);
+                    // Fallback: try to refresh the SAS URL
+                    if let Some(app_del) = get_app_delegate(mtm) {
+                        if let Some(ref token) = *app_del.ivars().refresh_token.lock().unwrap() {
+                            log::info!("Auto-save: Attempting to refresh SAS URL...");
+                            match call_get_url(token) {
+                                Ok((new_token, new_url)) => {
+                                    *app_del.ivars().refresh_token.lock().unwrap() = Some(new_token);
+                                    *app_del.ivars().container_sas_url.lock().unwrap() = Some(new_url.clone());
+                                    // Retry upload with new URL
+                                    if let Err(e2) = azure_upload(&new_url, &key, content.clone().into_bytes()) {
+                                        log::error!("Auto-save: Retry after URL refresh also failed: {:?}", e2);
+                                    } else {
+                                        log::info!("Auto-save: Retry after URL refresh succeeded for {}", key);
+                                    }
+                                }
+                                Err(e2) => {
+                                    log::error!("Auto-save: Failed to refresh SAS URL: {:?}", e2);
+                                }
                             }
-                        }
-                        Err(e) => {
-                            eprintln!("Auto-save: S3 upload failed: {:?}", e);
-                            print_error_chain(&*e);
                         }
                     }
                 }
@@ -419,184 +426,214 @@ fn auto_save_all_windows(mtm: MainThreadMarker) {
     }
 }
 
-// --- S3 Helper Functions ---
-// These functions accept a pre-initialized S3 client for reuse across operations.
+// --- Azure Blob Storage Helper Functions ---
+// These functions use a container SAS URL for authentication.
 
-/// Upload content to S3.
-fn s3_upload(client: &S3Client, bucket: &str, key: &str, body: Vec<u8>) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+const AUTH_BASE_URL: &str = "https://notes-auth-func.azurewebsites.net/api";
+
+/// Builds the full blob URL from the container SAS URL and a blob name
+fn build_blob_url(container_sas_url: &str, blob_name: &str) -> String {
+    if let Some(query_start) = container_sas_url.find('?') {
+        let base = &container_sas_url[..query_start];
+        let query = &container_sas_url[query_start..];
+        format!("{}/{}{}", base.trim_end_matches('/'), blob_name, query)
+    } else {
+        format!("{}/{}", container_sas_url.trim_end_matches('/'), blob_name)
+    }
+}
+
+/// Builds the list blobs URL from the container SAS URL
+fn build_list_url(container_sas_url: &str) -> String {
+    if let Some(query_start) = container_sas_url.find('?') {
+        let base = &container_sas_url[..query_start];
+        let query = &container_sas_url[query_start + 1..];
+        format!("{}?restype=container&comp=list&{}", base, query)
+    } else {
+        format!("{}?restype=container&comp=list", container_sas_url)
+    }
+}
+
+/// Fetches a blob from Azure Blob Storage using the container SAS URL
+fn azure_download(container_sas_url: &str, blob_name: &str) -> Result<Vec<u8>, Box<dyn std::error::Error + Send + Sync>> {
+    let blob_url = build_blob_url(container_sas_url, blob_name);
+    log::info!("[Azure] Fetching blob '{}'", blob_name);
+
     let rt = tokio::runtime::Runtime::new()?;
-    let bucket = bucket.to_string();
-    let key = key.to_string();
     rt.block_on(async {
-        client
-            .put_object()
-            .bucket(&bucket)
-            .key(&key)
-            .content_type("text/plain")
-            .body(ByteStream::from(body))
+        let client = reqwest::Client::new();
+        let response = client.get(&blob_url)
+            .header("x-ms-version", "2020-10-02")
             .send()
-            .await
-            .map(|_| ())
-            .map_err(|e| Box::<dyn std::error::Error + Send + Sync>::from(e))
+            .await?;
+
+        if !response.status().is_success() {
+            let status = response.status();
+            let body = response.text().await.unwrap_or_default();
+            return Err(format!("Azure blob fetch failed ({}): {}", status, body).into());
+        }
+
+        let bytes = response.bytes().await?;
+        Ok(bytes.to_vec())
     })
 }
 
-/// Generate a presigned GET URL for an S3 object.
-fn s3_presign_url(client: &S3Client, bucket: &str, key: &str, expires_secs: u64) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+/// Uploads content to Azure Blob Storage using the container SAS URL
+fn azure_upload(container_sas_url: &str, blob_name: &str, body: Vec<u8>) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let blob_url = build_blob_url(container_sas_url, blob_name);
+    log::info!("[Azure Upload] Uploading blob '{}'", blob_name);
+
     let rt = tokio::runtime::Runtime::new()?;
-    let bucket = bucket.to_string();
-    let key = key.to_string();
     rt.block_on(async {
-        let presigning_config = PresigningConfig::expires_in(Duration::from_secs(expires_secs))?;
-        let presigned = client
-            .get_object()
-            .bucket(&bucket)
-            .key(&key)
-            .presigned(presigning_config)
-            .await
-            .map_err(|e| Box::<dyn std::error::Error + Send + Sync>::from(e))?;
-        Ok(presigned.uri().to_string())
+        let client = reqwest::Client::new();
+        let response = client.put(&blob_url)
+            .header("x-ms-blob-type", "BlockBlob")
+            .header("x-ms-version", "2020-10-02")
+            .header("Content-Type", "text/plain; charset=utf-8")
+            .body(body)
+            .send()
+            .await?;
+
+        if !response.status().is_success() {
+            let status = response.status();
+            let body = response.text().await.unwrap_or_default();
+            return Err(format!("Azure upload failed ({}): {}", status, body).into());
+        }
+
+        log::info!("[Azure Upload] Upload successful");
+        Ok(())
     })
 }
 
-/// Download content from S3. Returns the raw bytes.
-fn s3_download(client: &S3Client, bucket: &str, key: &str) -> Result<Vec<u8>, Box<dyn std::error::Error + Send + Sync>> {
+/// Gets the last modified time of an Azure blob
+fn azure_last_modified(container_sas_url: &str, blob_name: &str) -> Result<Option<SystemTime>, Box<dyn std::error::Error + Send + Sync>> {
+    let blob_url = build_blob_url(container_sas_url, blob_name);
+
     let rt = tokio::runtime::Runtime::new()?;
-    let bucket = bucket.to_string();
-    let key = key.to_string();
     rt.block_on(async {
+        let client = reqwest::Client::new();
+        let response = client.head(&blob_url)
+            .header("x-ms-version", "2020-10-02")
+            .send()
+            .await?;
+
+        if !response.status().is_success() {
+            return Ok(None);
+        }
+
+        let last_modified = response.headers().get("Last-Modified")
+            .and_then(|v| v.to_str().ok())
+            .and_then(|s| httpdate::parse_http_date(s).ok());
+
+        Ok(last_modified)
+    })
+}
+
+/// Lists all blob names in the Azure container
+fn azure_list_keys(container_sas_url: &str) -> Result<Vec<String>, Box<dyn std::error::Error + Send + Sync>> {
+    let list_url = build_list_url(container_sas_url);
+    log::info!("[Azure List] Listing blobs...");
+
+    let rt = tokio::runtime::Runtime::new()?;
+    rt.block_on(async {
+        let client = reqwest::Client::new();
+        let response = client.get(&list_url)
+            .header("x-ms-version", "2020-10-02")
+            .send()
+            .await?;
+
+        if !response.status().is_success() {
+            let status = response.status();
+            let body = response.text().await.unwrap_or_default();
+            return Err(format!("Azure list blobs failed ({}): {}", status, body).into());
+        }
+
+        let body = response.text().await?;
+        let mut names = Vec::new();
+        for segment in body.split("<Name>") {
+            if let Some(end) = segment.find("</Name>") {
+                names.push(segment[..end].to_string());
+            }
+        }
+        names.sort();
+        log::info!("[Azure List] Found {} blobs", names.len());
+        Ok(names)
+    })
+}
+
+/// Calls get_url with the refresh token, returns (new_refresh_token, container_sas_url)
+fn call_get_url(refresh_token: &str) -> Result<(String, String), Box<dyn std::error::Error + Send + Sync>> {
+    let rt = tokio::runtime::Runtime::new()?;
+    rt.block_on(async {
+        let client = reqwest::Client::new();
         let resp = client
-            .get_object()
-            .bucket(&bucket)
-            .key(&key)
+            .post(format!("{}/get_url", AUTH_BASE_URL))
+            .body(refresh_token.to_string())
             .send()
-            .await
-            .map_err(|e| Box::<dyn std::error::Error + Send + Sync>::from(e))?;
-        let bytes = resp.body.collect().await
-            .map_err(|e| Box::<dyn std::error::Error + Send + Sync>::from(e))?;
-        Ok(bytes.into_bytes().to_vec())
+            .await?;
+        let body = resp.text().await?;
+        let json: serde_json::Value = serde_json::from_str(&body)?;
+        let new_token = json.get("refresh_token")
+            .and_then(|v| v.as_str())
+            .ok_or("Missing refresh_token in get_url response")?
+            .to_string();
+        let url = json.get("url")
+            .and_then(|v| v.as_str())
+            .ok_or("Missing url in get_url response")?
+            .to_string();
+        Ok((new_token, url))
     })
 }
 
-/// Get the last modified time of an S3 object.
-fn s3_last_modified(client: &S3Client, bucket: &str, key: &str) -> Result<Option<SystemTime>, Box<dyn std::error::Error + Send + Sync>> {
-    let rt = tokio::runtime::Runtime::new()?;
-    let bucket = bucket.to_string();
-    let key = key.to_string();
-    let maybe_dt = rt.block_on(async {
-        match client.head_object().bucket(&bucket).key(&key).send().await {
-            Ok(head_out) => Ok(head_out.last_modified().cloned()),
-            Err(e) => Err(Box::<dyn std::error::Error + Send + Sync>::from(e)),
-        }
-    })?;
-
-    let mtime: Option<SystemTime> = maybe_dt.and_then(|dt| {
-        let s = dt.to_string();
-        if let Ok(parsed) = chrono::DateTime::parse_from_rfc3339(&s) {
-            let utc = parsed.with_timezone(&Utc);
-            let secs = utc.timestamp();
-            let nsecs = utc.timestamp_subsec_nanos();
-            return UNIX_EPOCH.checked_add(Duration::new(secs as u64, nsecs));
-        }
-        None
-    });
-
-    Ok(mtime)
-}
-
-/// List all object keys from an S3 bucket. Uses pagination to handle large buckets.
-fn s3_list_keys(client: &S3Client, bucket: &str) -> Result<Vec<String>, Box<dyn std::error::Error + Send + Sync>> {
-    let rt = tokio::runtime::Runtime::new()?;
-    let bucket = bucket.to_string();
-    
-    rt.block_on(async {
-        let mut keys = Vec::new();
-        let mut continuation_token: Option<String> = None;
-        
-        loop {
-            let mut req = client.list_objects_v2().bucket(&bucket);
-            if let Some(token) = continuation_token.take() {
-                req = req.continuation_token(token);
-            }
-            
-            let resp = req.send().await?;
-            
-            for obj in resp.contents() {
-                if let Some(key) = obj.key() {
-                    keys.push(key.to_string());
-                }
-            }
-            
-            if resp.is_truncated() == Some(true) {
-                continuation_token = resp.next_continuation_token().map(|s| s.to_string());
-            } else {
-                break;
-            }
-        }
-        
-        keys.sort();
-        Ok(keys)
-    })
-}
-
-// Load file content from either S3 or local filesystem, preferring whichever is newer.
-// Returns `Some(content)` if a file was found, `None` if neither local nor S3 has the file.
-// If S3 is configured and has a newer version, it will be downloaded to the local path.
-fn load_file_content(path: &PathBuf, bucket: Option<&str>, s3_client: Option<&S3Client>) -> Option<String> {
+// Load file content from either Azure Blob or local filesystem, preferring whichever is newer.
+fn load_file_content(path: &PathBuf, container_sas_url: Option<&str>) -> Option<String> {
     let mut file_content: Option<String> = None;
 
-    // Get local modified time if the file exists
     let local_mtime: Option<SystemTime> = match std::fs::metadata(path) {
         Ok(md) => md.modified().ok(),
         Err(_) => None,
     };
 
-    // If S3 is configured and client is available, try to compare timestamps and conditionally use S3 data.
-    if let (Some(bucket), Some(client)) = (bucket, s3_client) {
-        // Derive the S3 key from the filename
+    if let Some(sas_url) = container_sas_url {
         let key = path
             .file_name()
             .and_then(|os| os.to_str())
             .map(|s| s.to_string())
             .unwrap_or_else(|| String::from("notes.txt"));
 
-        // Determine whether the S3 object is newer than the local file
-        match s3_last_modified(client, bucket, &key) {
-            Ok(bucket_mtime) => {
-                let should_use_bucket = match (bucket_mtime, local_mtime) {
+        match azure_last_modified(sas_url, &key) {
+            Ok(blob_mtime) => {
+                let should_use_remote = match (blob_mtime, local_mtime) {
                     (Some(bm), Some(lm)) => bm > lm,
-                    (Some(_bm), None) => true,
+                    (Some(_), None) => true,
                     _ => false,
                 };
 
-                if should_use_bucket {
-                    match s3_download(client, bucket, &key) {
+                if should_use_remote {
+                    match azure_download(sas_url, &key) {
                         Ok(bytes) => {
                             if let Err(e) = std::fs::write(path, &bytes) {
-                                eprintln!("Failed to write S3 notes to {}: {}", path.display(), e);
+                                log::error!("Failed to write Azure blob to {}: {}", path.display(), e);
                             } else if let Ok(s) = String::from_utf8(bytes) {
                                 file_content = Some(s);
-                                println!("Loaded from S3: s3://{}/{} -> {}", bucket, key, path.display());
+                                log::info!("Loaded from Azure: {} -> {}", key, path.display());
                             }
                         }
                         Err(e) => {
-                            // S3 object doesn't exist or other error - this is OK, we'll fall back to local
-                            eprintln!("S3 object not found or error s3://{}/{}: {:?}", bucket, key, e);
+                            log::error!("Azure blob download error for {}: {:?}", key, e);
                         }
                     }
                 }
             }
             Err(e) => {
-                eprintln!("S3 HEAD error: {:?}; will fall back to local file", e);
+                log::error!("Azure HEAD error: {:?}; will fall back to local file", e);
             }
         }
     }
 
-    // If we haven't set file_content from S3, try to read local file now.
     if file_content.is_none() {
         if let Ok(s) = std::fs::read_to_string(path) {
             file_content = Some(s);
-            println!("Loaded from local file: {}", path.display());
+            log::info!("Loaded from local file: {}", path.display());
         }
     }
 
@@ -630,30 +667,24 @@ define_class!(
             let content = text_view.string().to_string();
             
             match std::fs::write(&file_path, &content) {
-                Ok(_) => println!("Wrote notes to {}", file_path.display()),
-                Err(e) => eprintln!("Failed to write notes to {}: {}", file_path.display(), e),
+                Ok(_) => log::info!("Wrote notes to {}", file_path.display()),
+                Err(e) => log::error!("Failed to write notes to {}: {}", file_path.display(), e),
             }
 
-            // Upload to S3 if configured
-            if let Ok(bucket) = std::env::var("S3_BUCKET") {
+            // Upload to Azure if configured
+            if let Some(sas_url) = get_container_sas_url(self.mtm()) {
                 let key = file_path.file_name()
                     .and_then(|os| os.to_str())
                     .unwrap_or("notes.txt")
                     .to_string();
-                println!("S3 upload: s3://{}/{} ({} bytes)", bucket, key, content.len());
+                log::info!("Azure upload: {} ({} bytes)", key, content.len());
                 
-                if let Some(app_delegate) = get_s3_client(self.mtm()) {
-                    if let Some(client) = app_delegate.ivars().s3_client.get() {
-                        match s3_upload(client, &bucket, &key, content.clone().into_bytes()) {
-                            Ok(_) => println!("S3 upload succeeded for s3://{}/{}", bucket, key),
-                            Err(e) => {
-                                eprintln!("S3 upload failed: {:?}", e);
-                                print_error_chain(&*e);
-                            }
-                        }
+                match azure_upload(&sas_url, &key, content.clone().into_bytes()) {
+                    Ok(_) => log::info!("Azure upload succeeded for {}", key),
+                    Err(e) => {
+                        log::error!("Azure upload failed: {:?}", e);
+                        print_error_chain(&*e);
                     }
-                } else {
-                    eprintln!("S3 client not initialized");
                 }
             }
             
@@ -690,7 +721,7 @@ define_class!(
             let defaults = NSUserDefaults::standardUserDefaults();
             unsafe { defaults.setObject_forKey(Some(&array), ns_string!("windowStates")) };
             
-            println!("Saved window state (replacing previous)");
+            log::info!("Saved window state (replacing previous)");
 
             // Drop self-reference to allow deallocation
             *self.ivars().self_ref.lock().unwrap() = None;
@@ -728,36 +759,28 @@ define_class!(
                         if let Some(text_view) = self.ivars().text_view.get() {
                             let s = text_view.string().to_string();
                             if let Err(e) = std::fs::write(&chosen, &s) {
-                                eprintln!("Failed to write file {}: {}", chosen, e);
+                                log::error!("Failed to write file {}: {}", chosen, e);
                             } else {
-                                println!("Wrote notes to {}", chosen);
+                                log::info!("Wrote notes to {}", chosen);
                             }
 
-                            if let Ok(bucket) = std::env::var("S3_BUCKET") {
-                                // Derive S3 key from file basename
+                            if let Some(sas_url) = get_container_sas_url(self.mtm()) {
+                                // Derive key from file basename
                                 let key = std::path::Path::new(&chosen)
                                     .file_name()
                                     .and_then(|os| os.to_str())
                                     .map(|s| s.to_string())
                                     .unwrap_or_else(|| String::from("notes.txt"));
 
-                                println!("S3 upload requested: bucket='{}' key='{}' size={} bytes", bucket, key, s.len());
+                                log::info!("Azure upload requested: key='{}' size={} bytes", key, s.len());
                                 
-                                if let Some(app_delegate) = get_s3_client(self.mtm()) {
-                                    if let Some(client) = app_delegate.ivars().s3_client.get() {
-                                        match s3_upload(client, &bucket, &key, s.clone().into_bytes()) {
-                                            Ok(_) => println!("S3 upload succeeded for s3://{}/{}", bucket, key),
-                                            Err(e) => {
-                                                eprintln!("S3 upload failed for s3://{}/{}: {:?}", bucket, key, e);
-                                                print_error_chain(&*e);
-                                            }
-                                        }
+                                match azure_upload(&sas_url, &key, s.clone().into_bytes()) {
+                                    Ok(_) => log::info!("Azure upload succeeded for {}", key),
+                                    Err(e) => {
+                                        log::error!("Azure upload failed for {}: {:?}", key, e);
+                                        print_error_chain(&*e);
                                     }
-                                } else {
-                                    eprintln!("S3 client not initialized");
                                 }
-                            } else {
-                                println!("S3_BUCKET not set; skipping upload to S3");
                             }
                             
                             // Update hash after save
@@ -1038,18 +1061,274 @@ impl RemoteFilePicker {
     }
 }
 
-/// Shows a sign-in window with "Sign in with Apple" button.
-/// Returns true if user clicked sign in, false if cancelled/closed.
-fn show_sign_in_window(mtm: MainThreadMarker) -> bool {
-    use objc2_app_kit::NSView;
-    
-    // Activate app first so modal window can be shown
+// --- Apple Sign In Delegate ---
+
+struct AppleSignInDelegateIvars {
+    panel: OnceCell<Retained<NSPanel>>,
+    identity_token: Mutex<Option<String>>,
+    nonce: Mutex<Option<String>>,
+}
+
+impl Default for AppleSignInDelegateIvars {
+    fn default() -> Self {
+        Self {
+            panel: OnceCell::new(),
+            identity_token: Mutex::new(None),
+            nonce: Mutex::new(None),
+        }
+    }
+}
+
+define_class!(
+    #[unsafe(super = NSObject)]
+    #[thread_kind = MainThreadOnly]
+    #[ivars = AppleSignInDelegateIvars]
+    struct AppleSignInDelegate;
+
+    unsafe impl NSObjectProtocol for AppleSignInDelegate {}
+
+    unsafe impl ASAuthorizationControllerDelegate for AppleSignInDelegate {
+        #[unsafe(method(authorizationController:didCompleteWithAuthorization:))]
+        fn did_complete_with_authorization(
+            &self,
+            _controller: &ASAuthorizationController,
+            authorization: &ASAuthorization,
+        ) {
+            log::info!("Sign in with Apple succeeded!");
+
+            let credential_obj = unsafe { authorization.credential() };
+            if let Ok(apple_id_credential) = Retained::downcast::<ASAuthorizationAppleIDCredential>(credential_obj) {
+                if let Some(token_data) = unsafe { apple_id_credential.identityToken() } {
+                    let len: usize = unsafe { msg_send![&*token_data, length] };
+                    let ptr: *const u8 = unsafe { msg_send![&*token_data, bytes] };
+                    let token_bytes = if !ptr.is_null() && len > 0 {
+                        unsafe { std::slice::from_raw_parts(ptr, len) }.to_vec()
+                    } else {
+                        Vec::new()
+                    };
+                    if let Ok(token_str) = String::from_utf8(token_bytes) {
+                        log::info!("Identity token (JWT): {}", token_str);
+                        *self.ivars().identity_token.lock().unwrap() = Some(token_str);
+                    }
+                }
+
+                let user_id = unsafe { apple_id_credential.user() };
+                log::info!("User ID: {}", user_id);
+            }
+
+            let app = NSApplication::sharedApplication(self.mtm());
+            app.stopModal();
+            if let Some(panel) = self.ivars().panel.get() {
+                panel.orderOut(None);
+            }
+        }
+
+        #[unsafe(method(authorizationController:didCompleteWithError:))]
+        fn did_complete_with_error(
+            &self,
+            _controller: &ASAuthorizationController,
+            error: &NSError,
+        ) {
+            log::error!("Sign in with Apple failed: {:?}", error);
+            let app = NSApplication::sharedApplication(self.mtm());
+            app.stopModal();
+            if let Some(panel) = self.ivars().panel.get() {
+                panel.orderOut(None);
+            }
+        }
+    }
+
+    impl AppleSignInDelegate {
+        #[unsafe(method(performSignIn:))]
+        fn perform_sign_in(&self, _sender: *mut AnyObject) {
+            // First, fetch nonce from server
+            let link_code = {
+                // Read link code from the text field in the panel
+                if let Some(panel) = self.ivars().panel.get() {
+                    let content = panel.contentView().expect("panel must have content view");
+                    // Find the text field by tag (tag 100)
+                    if let Some(view) = content.viewWithTag(100) {
+                        let text_field: &objc2_app_kit::NSTextField = unsafe { &*(&*view as *const _ as *const objc2_app_kit::NSTextField) };
+                        let text = text_field.stringValue().to_string();
+                        if text.len() == 6 && text.chars().all(|c| c.is_ascii_digit()) {
+                            Some(text)
+                        } else {
+                            None
+                        }
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                }
+            };
+
+            let nonce_url = match &link_code {
+                Some(code) => format!("{}/get_nonce?link_code={}", AUTH_BASE_URL, code),
+                None => format!("{}/get_nonce", AUTH_BASE_URL),
+            };
+            log::info!("[Login] Fetching nonce from: {}", nonce_url);
+
+            let rt = match tokio::runtime::Runtime::new() {
+                Ok(rt) => rt,
+                Err(e) => {
+                    log::error!("[Login] Failed to create runtime: {}", e);
+                    return;
+                }
+            };
+
+            let nonce = match rt.block_on(async {
+                let resp = reqwest::get(&nonce_url).await?;
+                resp.text().await
+            }) {
+                Ok(n) => {
+                    log::info!("[Login] Received nonce: {}", n);
+                    n
+                }
+                Err(e) => {
+                    log::error!("[Login] Failed to fetch nonce: {}", e);
+                    return;
+                }
+            };
+
+            *self.ivars().nonce.lock().unwrap() = Some(nonce);
+
+            let provider = unsafe { ASAuthorizationAppleIDProvider::new() };
+            let request = unsafe { provider.createRequest() };
+
+            // Only request full name — no email scope to avoid the "Share My Email" prompt
+            let scopes = unsafe {
+                NSArray::from_retained_slice(&[
+                    objc2_authentication_services::ASAuthorizationScopeFullName.copy(),
+                ])
+            };
+            unsafe { request.setRequestedScopes(Some(&scopes)) };
+
+            // Set the nonce on the request
+            if let Some(nonce) = self.ivars().nonce.lock().unwrap().as_ref() {
+                let ns_nonce = NSString::from_str(nonce);
+                unsafe { request.setNonce(Some(&ns_nonce)) };
+            }
+
+            let request_as_base: Retained<objc2_authentication_services::ASAuthorizationRequest> =
+                Retained::into_super(Retained::into_super(request));
+            let requests = NSArray::from_retained_slice(&[request_as_base]);
+
+            let controller = unsafe {
+                ASAuthorizationController::initWithAuthorizationRequests(
+                    ASAuthorizationController::alloc(),
+                    &requests,
+                )
+            };
+
+            unsafe {
+                controller.setDelegate(Some(ProtocolObject::from_ref(self)));
+                controller.performRequests();
+            }
+        }
+    }
+);
+
+impl AppleSignInDelegate {
+    fn new(mtm: MainThreadMarker) -> Retained<Self> {
+        let this = Self::alloc(mtm).set_ivars(AppleSignInDelegateIvars::default());
+        unsafe { msg_send![super(this), init] }
+    }
+}
+
+/// Login result containing the tokens and SAS URL needed for cloud operations
+struct LoginResult {
+    refresh_token: String,
+    container_sas_url: String,
+}
+
+/// Performs the full login flow with fallback logic:
+/// 1. Show sign-in window (get nonce + Apple Sign In)
+/// 2. Send JWT to get_token → get refresh token
+/// 3. Send refresh token to get_url → get SAS URL
+/// If get_url fails, falls back to get_token. If get_token fails, falls back to sign-in.
+fn perform_login(mtm: MainThreadMarker) -> Option<LoginResult> {
+    loop {
+        // Step 1: Show sign-in window and get identity token
+        let identity_token = show_sign_in_window(mtm)?;
+        log::info!("[Login] Got identity token ({} chars)", identity_token.len());
+
+        // Step 2: Exchange identity token for refresh token via get_token
+        log::info!("[Login] Sending token to get_token endpoint...");
+        let refresh_token = match tokio::runtime::Runtime::new() {
+            Ok(rt) => {
+                match rt.block_on(async {
+                    let client = reqwest::Client::new();
+                    let url = format!("{}/get_token", AUTH_BASE_URL);
+                    log::info!("[Login] POST {}", url);
+                    let resp = client
+                        .post(&url)
+                        .body(identity_token.clone())
+                        .send()
+                        .await;
+                    match resp {
+                        Ok(r) => {
+                            let status = r.status();
+                            log::info!("[Login] get_token response status: {}", status);
+                            match r.text().await {
+                                Ok(body) => {
+                                    log::info!("[Login] get_token response body: {}", body);
+                                    if status.is_success() {
+                                        Ok(body)
+                                    } else {
+                                        Err(format!("get_token failed with status {}: {}", status, body))
+                                    }
+                                }
+                                Err(e) => Err(format!("Failed to read get_token response: {}", e)),
+                            }
+                        }
+                        Err(e) => Err(format!("get_token request failed: {}", e)),
+                    }
+                }) {
+                    Ok(token) => {
+                        log::info!("[Login] Got refresh token");
+                        token
+                    }
+                    Err(e) => {
+                        log::error!("[Login] get_token failed: {}, falling back to sign-in", e);
+                        continue;
+                    }
+                }
+            }
+            Err(e) => {
+                log::error!("[Login] Failed to create tokio runtime: {}, falling back to sign-in", e);
+                continue;
+            }
+        };
+
+        // Step 3: Exchange refresh token for SAS URL via get_url
+        log::info!("[Login] Calling get_url...");
+        match call_get_url(&refresh_token) {
+            Ok((new_refresh_token, url)) => {
+                log::info!("[Login] Got SAS URL");
+                return Some(LoginResult {
+                    refresh_token: new_refresh_token,
+                    container_sas_url: url,
+                });
+            }
+            Err(e) => {
+                log::error!("[Login] get_url failed: {:?}, falling back to sign-in", e);
+                continue; // Fall back to sign-in
+            }
+        }
+    }
+}
+
+/// Shows a sign-in window with "Sign in with Apple" button and link code field.
+/// Returns the identity token JWT if sign-in succeeded, None if cancelled.
+fn show_sign_in_window(mtm: MainThreadMarker) -> Option<String> {
+    use objc2_app_kit::{NSView, NSTextField};
+
     let app = NSApplication::sharedApplication(mtm);
     app.setActivationPolicy(NSApplicationActivationPolicy::Regular);
     #[allow(deprecated)]
     app.activateIgnoringOtherApps(true);
-    
-    // Create the panel
+
     let panel_rect = NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(400.0, 300.0));
     let panel = unsafe {
         let p = NSPanel::initWithContentRect_styleMask_backing_defer(
@@ -1064,10 +1343,13 @@ fn show_sign_in_window(mtm: MainThreadMarker) -> bool {
     };
     panel.setTitle(ns_string!("Sign In"));
     panel.center();
-    
+
     let content_view = panel.contentView().expect("panel must have content view");
-    
-    // Create Sign in with Apple button (centered)
+
+    let sign_in_delegate = AppleSignInDelegate::new(mtm);
+    let _ = sign_in_delegate.ivars().panel.set(panel.clone());
+
+    // Sign in with Apple button (centered, upper area)
     let button = unsafe {
         ASAuthorizationAppleIDButton::buttonWithType_style(
             ASAuthorizationAppleIDButtonType::SignIn,
@@ -1075,49 +1357,66 @@ fn show_sign_in_window(mtm: MainThreadMarker) -> bool {
             mtm,
         )
     };
-    
-    // Set button frame (centered in window, Apple recommends min 140x30)
+
     let button_width = 250.0;
     let button_height = 44.0;
     let button_x = (400.0 - button_width) / 2.0;
-    let button_y = (300.0 - button_height) / 2.0;
+    let button_y = 170.0; // Upper area
     let button_frame = NSRect::new(
         NSPoint::new(button_x, button_y),
         NSSize::new(button_width, button_height),
     );
-    
-    // Cast button to NSView and set frame
+
     let button_as_view: &NSView = unsafe { &*((&*button) as *const _ as *const NSView) };
     button_as_view.setFrame(button_frame);
     content_view.addSubview(button_as_view);
-    
-    // Set action to stopModal via NSControl
+
+    let delegate_obj: &AnyObject = sign_in_delegate.as_ref();
     let button_as_control: &NSControl = unsafe { &*((&*button) as *const _ as *const NSControl) };
     unsafe {
-        button_as_control.setAction(Some(sel!(stopModal)));
-        button_as_control.setTarget(Some(&*app));
+        button_as_control.setAction(Some(sel!(performSignIn:)));
+        button_as_control.setTarget(Some(delegate_obj));
     }
-    
+
+    // Link code label
+    let label = NSTextField::initWithFrame(
+        NSTextField::alloc(mtm),
+        NSRect::new(NSPoint::new(60.0, 110.0), NSSize::new(120.0, 20.0)),
+    );
+    label.setStringValue(ns_string!("Linking code:"));
+    label.setEditable(false);
+    label.setBordered(false);
+    label.setDrawsBackground(false);
+    content_view.addSubview(&label);
+
+    // Link code text field (6-digit number)
+    let link_code_field = NSTextField::initWithFrame(
+        NSTextField::alloc(mtm),
+        NSRect::new(NSPoint::new(180.0, 110.0), NSSize::new(100.0, 24.0)),
+    );
+    link_code_field.setPlaceholderString(Some(ns_string!("000000")));
+    link_code_field.setTag(100); // Tag for retrieval
+    content_view.addSubview(&link_code_field);
+
     // Run modal
-    let response = app.runModalForWindow(&panel);
-    
-    // NSModalResponseStop (0) means stopModal was called (button clicked)
-    panel.orderOut(None);
-    
-    // If the response indicates the modal was stopped (not aborted), user clicked sign in
-    response == objc2_app_kit::NSModalResponseStop
+    app.runModalForWindow(&panel);
+
+    let result = sign_in_delegate.ivars().identity_token.lock().unwrap().clone();
+    result
 }
 
 struct AppDelegateIvars {
     is_terminating: Mutex<bool>,
-    s3_client: OnceCell<S3Client>,
+    container_sas_url: Mutex<Option<String>>,
+    refresh_token: Mutex<Option<String>>,
 }
 
 impl Default for AppDelegateIvars {
     fn default() -> Self {
         Self {
             is_terminating: Mutex::new(false),
-            s3_client: OnceCell::new(),
+            container_sas_url: Mutex::new(None),
+            refresh_token: Mutex::new(None),
         }
     }
 }
@@ -1144,41 +1443,25 @@ define_class!(
             // Set termination flag so window_will_close skips saving
             *self.ivars().is_terminating.lock().unwrap() = true;
 
-            println!("applicationWillTerminate: entering");
+            log::info!("applicationWillTerminate: entering");
             let mtm = self.mtm();
             let app = NSApplication::sharedApplication(mtm);
-            println!("applicationWillTerminate: window count = {}", app.windows().count());
+            log::info!("applicationWillTerminate: window count = {}", app.windows().count());
             save_window_states(mtm);
-            println!("applicationWillTerminate: exiting");
+            log::info!("applicationWillTerminate: exiting");
         }
 
         #[unsafe(method(applicationDidFinishLaunching:))]
         fn did_finish_launching(&self, notification: &NSNotification) {
             let mtm = self.mtm();
 
-            // Check if AWS credentials are configured
-            if std::env::var("AWS_ACCESS_KEY_ID").is_err() {
-                // Show sign-in window first
-                let signed_in = show_sign_in_window(mtm);
-                println!("Sign in result: {}", signed_in);
-                // For now, continue regardless of result (placeholder)
-            }
-
-            // Initialize S3 client if S3_BUCKET is configured
-            if std::env::var("S3_BUCKET").is_ok() {
-                match tokio::runtime::Runtime::new() {
-                    Ok(rt) => {
-                        let client = rt.block_on(async {
-                            let cfg = aws_config::load_defaults(aws_config::BehaviorVersion::latest()).await;
-                            S3Client::new(&cfg)
-                        });
-                        let _ = self.ivars().s3_client.set(client);
-                        println!("S3 client initialized");
-                    }
-                    Err(e) => {
-                        eprintln!("Failed to create tokio runtime for S3 client init: {}", e);
-                    }
-                }
+            // Perform login flow: get_nonce → Apple Sign In → get_token → get_url
+            if let Some(result) = perform_login(mtm) {
+                log::info!("Login succeeded, SAS URL obtained");
+                *self.ivars().container_sas_url.lock().unwrap() = Some(result.container_sas_url);
+                *self.ivars().refresh_token.lock().unwrap() = Some(result.refresh_token);
+            } else {
+                log::info!("Login cancelled, continuing in offline mode");
             }
 
             let app = { notification.object() }
@@ -1351,7 +1634,7 @@ define_class!(
                         true,
                     )
                 };
-                println!("Auto-save timer scheduled (every 5 minutes)");
+                log::info!("Auto-save timer scheduled (every 5 minutes)");
             }
         }
     }
@@ -1359,7 +1642,7 @@ define_class!(
     impl AppDelegate {
         #[unsafe(method(autoSave:))]
         fn auto_save(&self, _timer: *mut objc2::runtime::AnyObject) {
-            println!("[DEBUG] auto_save: timer fired!");
+            log::debug!(" auto_save: timer fired!");
             auto_save_all_windows(self.mtm());
         }
     }
@@ -1368,89 +1651,105 @@ define_class!(
         #[unsafe(method(newWindow:))]
         fn new_window(&self, _sender: *mut objc2::runtime::AnyObject) {
             let mtm = self.mtm();
-            println!("new_window selector invoked");
+            log::info!("new_window selector invoked");
             
-            // Check if S3 is configured
-            let bucket = match std::env::var("S3_BUCKET") {
-                Ok(b) => b,
-                Err(_) => {
-                    eprintln!("S3_BUCKET not configured - cannot open remote file picker");
+            // Get container SAS URL
+            let sas_url = match self.ivars().container_sas_url.lock().unwrap().clone() {
+                Some(url) => url,
+                None => {
+                    log::error!("No Azure SAS URL configured - cannot open remote file picker");
                     return;
                 }
             };
             
-            // Get S3 client
-            let Some(client) = self.ivars().s3_client.get() else {
-                eprintln!("S3 client not initialized");
-                return;
-            };
-            
-            // List all keys from the bucket
-            println!("Listing keys from S3 bucket: {}", bucket);
-            let keys = match s3_list_keys(client, &bucket) {
+            // List all blobs from the container
+            log::info!("Listing blobs from Azure container...");
+            let keys = match azure_list_keys(&sas_url) {
                 Ok(k) => {
-                    println!("Found {} keys in bucket", k.len());
+                    log::info!("Found {} blobs", k.len());
                     k
                 }
                 Err(e) => {
-                    eprintln!("Failed to list S3 bucket keys: {:?}", e);
-                    return;
+                    log::error!("Failed to list Azure blobs: {:?}", e);
+                    // Fallback: try to refresh SAS URL
+                    if let Some(ref token) = *self.ivars().refresh_token.lock().unwrap() {
+                        match call_get_url(token) {
+                            Ok((new_token, new_url)) => {
+                                *self.ivars().refresh_token.lock().unwrap() = Some(new_token);
+                                *self.ivars().container_sas_url.lock().unwrap() = Some(new_url.clone());
+                                match azure_list_keys(&new_url) {
+                                    Ok(k) => k,
+                                    Err(e2) => {
+                                        log::error!("Failed to list after URL refresh: {:?}", e2);
+                                        return;
+                                    }
+                                }
+                            }
+                            Err(e2) => {
+                                log::error!("Failed to refresh SAS URL: {:?}", e2);
+                                return;
+                            }
+                        }
+                    } else {
+                        return;
+                    }
                 }
             };
             
             if keys.is_empty() {
-                eprintln!("No files found in bucket");
+                log::error!("No files found in Azure container");
                 return;
             }
             
             // Show custom file picker
             let picker = RemoteFilePicker::new(mtm);
             let Some(selected_key) = picker.run_modal(keys) else {
-                println!("File picker cancelled");
+                log::info!("File picker cancelled");
                 return;
             };
             
-            println!("Selected key: {}", selected_key);
+            log::info!("Selected key: {}", selected_key);
             
-            // Download the file from S3 and create local copy
             let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
             let local_path = PathBuf::from(&home).join("Notes").join(&selected_key);
             
-            // Create parent directories if needed
             if let Some(parent) = local_path.parent() {
                 let _ = std::fs::create_dir_all(parent);
             }
             
-            // Download from S3
-            match s3_download(client, &bucket, &selected_key) {
+            // Get latest SAS URL (may have been refreshed)
+            let current_sas = self.ivars().container_sas_url.lock().unwrap().clone()
+                .unwrap_or(sas_url);
+            
+            // Download from Azure
+            match azure_download(&current_sas, &selected_key) {
                 Ok(bytes) => {
                     if let Err(e) = std::fs::write(&local_path, &bytes) {
-                        eprintln!("Failed to write file to {}: {}", local_path.display(), e);
+                        log::error!("Failed to write file to {}: {}", local_path.display(), e);
                         return;
                     }
-                    println!("Downloaded s3://{}/{} to {}", bucket, selected_key, local_path.display());
+                    log::info!("Downloaded {} to {}", selected_key, local_path.display());
                 }
                 Err(e) => {
-                    eprintln!("Failed to download s3://{}/{}: {:?}", bucket, selected_key, e);
+                    log::error!("Failed to download {}: {:?}", selected_key, e);
                     return;
                 }
             }
             
-            // Create window with the downloaded file
             create_window(mtm, &local_path.to_string_lossy(), None);
         }
 
         #[unsafe(method(newWindowLocal:))]
         fn new_window_local(&self, _sender: *mut objc2::runtime::AnyObject) {
             let mtm = self.mtm();
-            println!("newWindowLocal selector invoked");
+            log::info!("newWindowLocal selector invoked");
             
             // Generate a unique dated filename in ~/Notes/
             let file_path = generate_unique_dated_filepath();
             
             // Create an empty file
             if let Err(e) = std::fs::write(&file_path, "") {
-                eprintln!("Failed to create file {}: {}", file_path.display(), e);
+                log::error!("Failed to create file {}: {}", file_path.display(), e);
                 return;
             }
             
@@ -1483,23 +1782,35 @@ fn is_app_terminating(mtm: MainThreadMarker) -> bool {
     result
 }
 
-/// Get a reference to the S3 client from the AppDelegate, if configured
-fn get_s3_client(mtm: MainThreadMarker) -> Option<Retained<AppDelegate>> {
+/// Get the container SAS URL from the AppDelegate, if configured
+fn get_container_sas_url(mtm: MainThreadMarker) -> Option<String> {
     let app = NSApplication::sharedApplication(mtm);
     let delegate_proto = app.delegate()?;
     let delegate_obj: Retained<NSObject> = unsafe { 
         Retained::cast_unchecked(delegate_proto) 
     };
     let delegate = Retained::downcast::<AppDelegate>(delegate_obj).ok()?;
-    // Only return if client is initialized
-    if delegate.ivars().s3_client.get().is_some() {
-        Some(delegate)
-    } else {
-        None
-    }
+    let result = delegate.ivars().container_sas_url.lock().unwrap().clone();
+    result
+}
+
+/// Get a reference to the AppDelegate
+fn get_app_delegate(mtm: MainThreadMarker) -> Option<Retained<AppDelegate>> {
+    let app = NSApplication::sharedApplication(mtm);
+    let delegate_proto = app.delegate()?;
+    let delegate_obj: Retained<NSObject> = unsafe { 
+        Retained::cast_unchecked(delegate_proto) 
+    };
+    Retained::downcast::<AppDelegate>(delegate_obj).ok()
 }
 
 fn main() {
+    // Initialize unified macOS logging (os_log)
+    oslog::OsLogger::new("com.weatjar.notes")
+        .level_filter(log::LevelFilter::Debug)
+        .init()
+        .expect("failed to init os_log logger");
+
     let mtm = MainThreadMarker::new().unwrap();
 
     let app = NSApplication::sharedApplication(mtm);
