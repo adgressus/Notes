@@ -1,54 +1,16 @@
 mod blob;
+mod jwt;
 mod table;
 mod util;
 
-use std::collections::HashMap;
 use std::env;
 use std::io::{BufRead, BufReader, Write};
 use std::net::TcpListener;
-use std::sync::{LazyLock, Mutex};
-use std::time::Instant;
 
-use jsonwebtoken::{decode, decode_header, Algorithm, DecodingKey, Validation};
 use log::{info, warn, error, LevelFilter, Log, Metadata, Record};
 use rand::RngExt;
-use serde::Deserialize;
 
 use table::TableError;
-
-// ─── JWT validation ─────────────────────────────────────────────
-
-static JWKS_CACHE: LazyLock<Mutex<HashMap<String, CachedJwks>>> =
-    LazyLock::new(|| Mutex::new(HashMap::new()));
-
-#[derive(Deserialize)]
-struct Claims {
-    iss: Option<String>,
-    nonce: Option<String>,
-    sub: Option<String>,
-}
-
-#[derive(Deserialize)]
-struct OidcConfig {
-    jwks_uri: String,
-}
-
-#[derive(Clone, Deserialize)]
-struct Jwk {
-    kid: String,
-    n: String,
-    e: String,
-}
-
-#[derive(Clone, Deserialize)]
-struct JwksResponse {
-    keys: Vec<Jwk>,
-}
-
-struct CachedJwks {
-    keys: Vec<Jwk>,
-    fetched_at: Instant,
-}
 
 struct ConsoleLogger;
 
@@ -73,102 +35,6 @@ fn random_hex(bytes: usize) -> String {
     (0..bytes)
         .map(|_| format!("{:02x}", rng.random::<u8>()))
         .collect()
-}
-
-
-/// Fetch JWKS signing keys for an OIDC issuer, cached for 1 hour.
-fn get_jwks(issuer: &str) -> Option<Vec<Jwk>> {
-    // Check cache (refresh every hour)
-    {
-        let cache = JWKS_CACHE.lock().ok()?;
-        if let Some(cached) = cache.get(issuer) {
-            if cached.fetched_at.elapsed().as_secs() < 3600 {
-                return Some(cached.keys.clone());
-            }
-        }
-    }
-
-    // OIDC discovery
-    let discovery_url = format!(
-        "{}/.well-known/openid-configuration",
-        issuer.trim_end_matches('/')
-    );
-    info!("Fetching OIDC config from {discovery_url}");
-
-    let resp = ureq::get(&discovery_url).call().ok()?;
-    let body = resp.into_body().read_to_string().ok()?;
-    let config: OidcConfig = serde_json::from_str(&body).ok()?;
-
-    info!("Fetching JWKS from {}", config.jwks_uri);
-    let resp = ureq::get(&config.jwks_uri).call().ok()?;
-    let body = resp.into_body().read_to_string().ok()?;
-    let jwks: JwksResponse = serde_json::from_str(&body).ok()?;
-
-    if let Ok(mut cache) = JWKS_CACHE.lock() {
-        cache.insert(issuer.to_string(), CachedJwks {
-            keys: jwks.keys.clone(),
-            fetched_at: Instant::now(),
-        });
-    }
-
-    Some(jwks.keys)
-}
-
-/// Extract the issuer from a JWT without verifying the signature.
-fn extract_issuer(jwt: &str) -> Result<String, String> {
-    use base64::engine::general_purpose::URL_SAFE_NO_PAD;
-    use base64::Engine;
-
-    let payload = jwt.split('.').nth(1)
-        .ok_or_else(|| "Invalid JWT format".to_string())?;
-    let bytes = URL_SAFE_NO_PAD.decode(payload)
-        .map_err(|e| format!("Failed to decode JWT payload: {e}"))?;
-    let value: serde_json::Value = serde_json::from_slice(&bytes)
-        .map_err(|e| format!("Failed to parse JWT payload: {e}"))?;
-
-    value["iss"].as_str()
-        .map(|s| s.to_string())
-        .ok_or_else(|| "JWT missing iss claim".to_string())
-}
-
-/// Derive a provider name from an issuer URL.
-fn issuer_to_provider(issuer: &str) -> &str {
-    issuer
-        .strip_prefix("https://")
-        .or_else(|| issuer.strip_prefix("http://"))
-        .and_then(|s| s.split('/').next())
-        .unwrap_or(issuer)
-}
-
-/// Validate a JWT from any OIDC-compliant provider.
-/// Uses the token's `iss` claim for OIDC discovery.
-fn validate_jwt(jwt: &str) -> Result<Claims, String> {
-    // Decode header to find which key was used
-    let header = decode_header(jwt)
-        .map_err(|e| format!("Invalid JWT header: {e}"))?;
-    let kid = header.kid
-        .ok_or_else(|| "JWT missing kid in header".to_string())?;
-
-    // Extract issuer from unverified payload
-    let issuer = extract_issuer(jwt)?;
-
-    // Fetch JWKS via OIDC discovery and find matching key
-    let keys = get_jwks(&issuer)
-        .ok_or_else(|| "Failed to fetch JWKS".to_string())?;
-    let jwk = keys.iter().find(|k| k.kid == kid)
-        .ok_or_else(|| format!("No matching key for kid: {kid}"))?;
-
-    let decoding_key = DecodingKey::from_rsa_components(&jwk.n, &jwk.e)
-        .map_err(|e| format!("Invalid RSA key: {e}"))?;
-
-    let mut validation = Validation::new(Algorithm::RS256);
-    validation.validate_aud = false;
-    validation.set_issuer(&[&issuer]);
-
-    let token_data = decode::<Claims>(jwt, &decoding_key, &validation)
-        .map_err(|e| format!("JWT validation failed: {e}"))?;
-
-    Ok(token_data.claims)
 }
 
 // ─── Handlers ──────────────────────────────────────────────────
@@ -241,7 +107,7 @@ fn get_token(jwt: &str) -> (&'static str, String) {
         return ("400 Bad Request", "missing token".to_string());
     }
 
-    let claims = match validate_jwt(jwt) {
+    let claims = match jwt::validate(jwt) {
         Ok(c) => c,
         Err(e) => {
             warn!("JWT validation failed: {e}");
@@ -289,7 +155,7 @@ fn get_token(jwt: &str) -> (&'static str, String) {
 
     let user_id = if !nonce_user_id.is_empty() {
         // Linking session — create linked account
-        let provider = issuer_to_provider(&issuer);
+        let provider = jwt::issuer_to_provider(&issuer);
         match table::insert(
             "linkedaccounts", "linked_accounts", &sub,
             &format!(r#""account_provider": "{provider}", "user_id": "{nonce_user_id}""#),
