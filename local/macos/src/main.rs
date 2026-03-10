@@ -402,8 +402,9 @@ fn auto_save_all_windows(mtm: MainThreadMarker) {
                             log::info!("Auto-save: Attempting to refresh SAS URL...");
                             match call_get_url(token) {
                                 Ok((new_token, new_url)) => {
-                                    *app_del.ivars().refresh_token.lock().unwrap() = Some(new_token);
+                                    *app_del.ivars().refresh_token.lock().unwrap() = Some(new_token.clone());
                                     *app_del.ivars().container_sas_url.lock().unwrap() = Some(new_url.clone());
+                                    save_token_to_keychain(&new_token);
                                     // Retry upload with new URL
                                     if let Err(e2) = azure_upload(&new_url, &key, content.clone().into_bytes()) {
                                         log::error!("Auto-save: Retry after URL refresh also failed: {:?}", e2);
@@ -430,6 +431,47 @@ fn auto_save_all_windows(mtm: MainThreadMarker) {
 // These functions use a container SAS URL for authentication.
 
 const AUTH_BASE_URL: &str = "https://notes-auth-func.azurewebsites.net/api";
+
+const KEYCHAIN_SERVICE: &str = "com.notes.app";
+const KEYCHAIN_ACCOUNT: &str = "refresh_token";
+
+fn save_token_to_keychain(token: &str) {
+    use security_framework::passwords::set_generic_password;
+    match set_generic_password(KEYCHAIN_SERVICE, KEYCHAIN_ACCOUNT, token.as_bytes()) {
+        Ok(()) => log::info!("Saved refresh token to keychain"),
+        Err(e) => log::error!("Failed to save token to keychain: {}", e),
+    }
+}
+
+fn load_token_from_keychain() -> Option<String> {
+    use security_framework::passwords::get_generic_password;
+    match get_generic_password(KEYCHAIN_SERVICE, KEYCHAIN_ACCOUNT) {
+        Ok(bytes) => match String::from_utf8(bytes) {
+            Ok(s) => {
+                log::info!("Loaded refresh token from keychain");
+                Some(s)
+            }
+            Err(e) => {
+                log::error!("Keychain token is not valid UTF-8: {}", e);
+                None
+            }
+        },
+        Err(e) if e.code() == -25300 => None, // errSecItemNotFound
+        Err(e) => {
+            log::error!("Failed to load token from keychain: {}", e);
+            None
+        }
+    }
+}
+
+fn delete_token_from_keychain() {
+    use security_framework::passwords::delete_generic_password;
+    match delete_generic_password(KEYCHAIN_SERVICE, KEYCHAIN_ACCOUNT) {
+        Ok(()) => log::info!("Deleted refresh token from keychain"),
+        Err(e) if e.code() == -25300 => {} // already gone
+        Err(e) => log::error!("Failed to delete token from keychain: {}", e),
+    }
+}
 
 /// Builds the full blob URL from the container SAS URL and a blob name
 fn build_blob_url(container_sas_url: &str, blob_name: &str) -> String {
@@ -1455,13 +1497,39 @@ define_class!(
         fn did_finish_launching(&self, notification: &NSNotification) {
             let mtm = self.mtm();
 
-            // Perform login flow: get_nonce → Apple Sign In → get_token → get_url
-            if let Some(result) = perform_login(mtm) {
-                log::info!("Login succeeded, SAS URL obtained");
-                *self.ivars().container_sas_url.lock().unwrap() = Some(result.container_sas_url);
-                *self.ivars().refresh_token.lock().unwrap() = Some(result.refresh_token);
+            // Try to restore session from keychain first
+            if let Some(saved_token) = load_token_from_keychain() {
+                log::info!("Found saved refresh token, attempting to resume session...");
+                match call_get_url(&saved_token) {
+                    Ok((new_token, url)) => {
+                        log::info!("Session restored from keychain");
+                        *self.ivars().container_sas_url.lock().unwrap() = Some(url);
+                        *self.ivars().refresh_token.lock().unwrap() = Some(new_token.clone());
+                        save_token_to_keychain(&new_token);
+                    }
+                    Err(e) => {
+                        log::warn!("Saved token expired or invalid: {:?}, falling back to login", e);
+                        delete_token_from_keychain();
+                        if let Some(result) = perform_login(mtm) {
+                            log::info!("Login succeeded, SAS URL obtained");
+                            *self.ivars().container_sas_url.lock().unwrap() = Some(result.container_sas_url);
+                            *self.ivars().refresh_token.lock().unwrap() = Some(result.refresh_token.clone());
+                            save_token_to_keychain(&result.refresh_token);
+                        } else {
+                            log::info!("Login cancelled, continuing in offline mode");
+                        }
+                    }
+                }
             } else {
-                log::info!("Login cancelled, continuing in offline mode");
+                // No saved token, perform full login
+                if let Some(result) = perform_login(mtm) {
+                    log::info!("Login succeeded, SAS URL obtained");
+                    *self.ivars().container_sas_url.lock().unwrap() = Some(result.container_sas_url);
+                    *self.ivars().refresh_token.lock().unwrap() = Some(result.refresh_token.clone());
+                    save_token_to_keychain(&result.refresh_token);
+                } else {
+                    log::info!("Login cancelled, continuing in offline mode");
+                }
             }
 
             let app = { notification.object() }

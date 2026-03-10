@@ -199,7 +199,7 @@ fn get_token(jwt: &str) -> (&'static str, String) {
     match table::insert(
         "sessions", "sessions", &refresh_token,
         &format!(r#""user_id": "{user_id}""#),
-        Some(86400),
+        Some(604800),
     ) {
         Ok(_) => info!("Session created for user {user_id}"),
         Err(e) => {

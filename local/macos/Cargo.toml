@@ -29,3 +29,4 @@ chrono = { version = "0.4", features = ["alloc"] }
 httpdate = "1"
 log = "0.4"
 oslog = { version = "0.2", features = ["logger"] }
+security-framework = "3"
