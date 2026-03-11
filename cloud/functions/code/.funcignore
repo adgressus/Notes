@@ -1,8 +1,13 @@
 .git*
-.vscode
-__azurite_db*__.json
-__blobstorage__
-__queuestorage__
+.funcignore
+Cargo.*
 local.settings.json
+.DS_Store
+.cargo
+.cargo/*
 test
+test/*
 target
+target/*
+src
+src/*

@@ -1,21 +1,23 @@
-# Set up build environment
+#### Set up build environment
 rustup target add x86_64-unknown-linux-musl
 brew install filosottile/musl-cross/musl-cross # macos c cross compiler. needed for rustls because c still has that special microcode magic
 
 
-# Update infra
+#### Update infra
 az deployment sub create \
   --location eastus2 \
   --template-file cloud/functions/infra/main.bicep \
   --parameters cloud/functions/infra/parameters.json
 
-# Redeploy the entire function App
+#### Redeploy the entire function App
 az functionapp deploy \
   --resource-group notes-auth-rg \
   --name notes-auth-func \
   --src-path function-app.zip \
   --type zip
 
+#### Build and deploy in one go
+`$VSCODE_ROOT/tools/funcdeploy.sh`
 
 ## Kusto Help
 ```

@@ -8,5 +8,9 @@
         "cloud/functions/code/Cargo.toml",
         "local/macos/Cargo.toml",
         "local/windows/Cargo.toml"
-    ]
+    ],
+    // passing root path to the terminal for use in scripts
+    "terminal.integrated.env.osx": {
+        "VSCODE_ROOT": "${workspaceFolder}"
+    }
 }
