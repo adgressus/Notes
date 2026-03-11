@@ -8,6 +8,7 @@ use windows::{
     Win32::{
         Foundation::*,
         Graphics::Gdi::*,
+        Security::Credentials::*,
         System::LibraryLoader::GetModuleHandleW,
         UI::Controls::Dialogs::*,
         UI::Input::KeyboardAndMouse::{SetFocus, GetKeyState},
@@ -24,6 +25,57 @@ static mut CURRENT_FILE_PATH: Option<PathBuf> = None;
 static mut CURRENT_FILE_NAME: Option<String> = None;
 static mut CONTAINER_SAS_URL: Option<String> = None;
 static mut REFRESH_TOKEN: Option<String> = None;
+
+const CREDENTIAL_TARGET: &str = "NotesApp/RefreshToken";
+
+/// Saves the refresh token to Windows Credential Manager
+fn save_refresh_token(token: &str) {
+    let target_wide: Vec<u16> = CREDENTIAL_TARGET.encode_utf16().chain(std::iter::once(0)).collect();
+    let mut blob = token.as_bytes().to_vec();
+    let cred = CREDENTIALW {
+        Type: CRED_TYPE_GENERIC,
+        TargetName: PWSTR(target_wide.as_ptr() as *mut _),
+        CredentialBlobSize: blob.len() as u32,
+        CredentialBlob: blob.as_mut_ptr(),
+        Persist: CRED_PERSIST_LOCAL_MACHINE,
+        ..unsafe { zeroed() }
+    };
+    unsafe {
+        if let Err(e) = CredWriteW(&cred, 0) {
+            eprintln!("[Cred] Failed to save refresh token: {}", e);
+        } else {
+            println!("[Cred] Refresh token saved to Credential Manager");
+        }
+    }
+}
+
+/// Loads the refresh token from Windows Credential Manager
+fn load_refresh_token() -> Option<String> {
+    let target_wide: Vec<u16> = CREDENTIAL_TARGET.encode_utf16().chain(std::iter::once(0)).collect();
+    let mut cred_ptr = std::ptr::null_mut();
+    unsafe {
+        if CredReadW(PCWSTR(target_wide.as_ptr()), CRED_TYPE_GENERIC, 0, &mut cred_ptr).is_ok() {
+            let cred = &*cred_ptr;
+            let blob = std::slice::from_raw_parts(cred.CredentialBlob, cred.CredentialBlobSize as usize);
+            let token = String::from_utf8_lossy(blob).to_string();
+            CredFree(cred_ptr as *const _);
+            println!("[Cred] Loaded refresh token from Credential Manager");
+            Some(token)
+        } else {
+            println!("[Cred] No saved refresh token found");
+            None
+        }
+    }
+}
+
+/// Deletes the refresh token from Windows Credential Manager
+fn delete_refresh_token() {
+    let target_wide: Vec<u16> = CREDENTIAL_TARGET.encode_utf16().chain(std::iter::once(0)).collect();
+    unsafe {
+        let _ = CredDeleteW(PCWSTR(target_wide.as_ptr()), CRED_TYPE_GENERIC, 0);
+        println!("[Cred] Refresh token deleted from Credential Manager");
+    }
+}
 
 /// Builds the full blob URL from the container SAS URL and a blob name
 fn build_blob_url(container_sas_url: &str, blob_name: &str) -> String {
@@ -168,6 +220,138 @@ async fn upload_notes_to_azure(container_sas_url: &str, blob_name: &str, content
     Ok(())
 }
 
+/// Calls the get_url endpoint to exchange a refresh token for a new SAS URL
+async fn call_get_url(refresh_token: &str) -> std::result::Result<(String, Option<String>), Box<dyn std::error::Error + Send + Sync>> {
+    println!("[GetURL] Calling get_url with refresh token...");
+    let client = reqwest::Client::new();
+    let resp = client
+        .post("https://notes-auth-func.azurewebsites.net/api/get_url")
+        .body(refresh_token.to_string())
+        .send()
+        .await?;
+
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let body = resp.text().await.unwrap_or_default();
+        return Err(format!("get_url failed ({}): {}", status, body).into());
+    }
+
+    let body = resp.text().await?;
+    let json: serde_json::Value = serde_json::from_str(&body)?;
+
+    let url = json.get("url")
+        .and_then(|v| v.as_str())
+        .ok_or("Missing 'url' in get_url response")?
+        .to_string();
+
+    let new_token = json.get("refresh_token")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
+
+    println!("[GetURL] Successfully obtained new SAS URL");
+    Ok((url, new_token))
+}
+
+/// Attempts to refresh the SAS URL. First tries using the refresh token,
+/// then falls back to showing the login dialog.
+/// Returns the new SAS URL if successful, or None if the user cancels.
+unsafe fn refresh_credentials(rt: &tokio::runtime::Runtime) -> Option<String> {
+    println!("[Refresh] Attempting to refresh credentials...");
+
+    // Step 1: Try to get a new URL using the refresh token
+    if let Some(ref token) = REFRESH_TOKEN {
+        println!("[Refresh] Trying get_url with existing refresh token...");
+        match rt.block_on(call_get_url(token)) {
+            Ok((new_sas, new_token)) => {
+                println!("[Refresh] Successfully refreshed SAS URL");
+                CONTAINER_SAS_URL = Some(new_sas.clone());
+                if let Some(t) = new_token {
+                    save_refresh_token(&t);
+                    REFRESH_TOKEN = Some(t);
+                }
+                return Some(new_sas);
+            }
+            Err(e) => {
+                eprintln!("[Refresh] Failed to refresh SAS URL: {}", e);
+            }
+        }
+    } else {
+        println!("[Refresh] No refresh token available, skipping get_url");
+    }
+
+    // Step 2: Show login dialog to re-authenticate
+    println!("[Refresh] Showing login dialog for re-authentication...");
+    let template = build_login_dialog_template();
+    let instance = GetModuleHandleW(None).unwrap_or_default();
+    DialogBoxIndirectParamW(
+        instance,
+        template.as_ptr() as *const DLGTEMPLATE,
+        MAIN_HWND,
+        Some(login_dlg_proc),
+        LPARAM(0),
+    );
+
+    // Check if login was successful
+    CONTAINER_SAS_URL.clone()
+}
+
+/// Fetches notes from Azure with automatic credential refresh on failure
+unsafe fn fetch_notes_with_retry(
+    rt: &tokio::runtime::Runtime,
+    blob_name: &str,
+) -> std::result::Result<(String, Option<SystemTime>), Box<dyn std::error::Error + Send + Sync>> {
+    let sas = CONTAINER_SAS_URL.clone().ok_or("No SAS URL configured")?;
+
+    match rt.block_on(fetch_notes_from_azure(&sas, blob_name)) {
+        Ok(result) => Ok(result),
+        Err(e) => {
+            eprintln!("[Retry] Fetch failed: {}, attempting credential refresh...", e);
+            match refresh_credentials(rt) {
+                Some(new_sas) => rt.block_on(fetch_notes_from_azure(&new_sas, blob_name)),
+                None => Err(e),
+            }
+        }
+    }
+}
+
+/// Uploads notes to Azure with automatic credential refresh on failure
+unsafe fn upload_notes_with_retry(
+    rt: &tokio::runtime::Runtime,
+    blob_name: &str,
+    content: &str,
+) -> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let sas = CONTAINER_SAS_URL.clone().ok_or("No SAS URL configured")?;
+
+    match rt.block_on(upload_notes_to_azure(&sas, blob_name, content)) {
+        Ok(result) => Ok(result),
+        Err(e) => {
+            eprintln!("[Retry] Upload failed: {}, attempting credential refresh...", e);
+            match refresh_credentials(rt) {
+                Some(new_sas) => rt.block_on(upload_notes_to_azure(&new_sas, blob_name, content)),
+                None => Err(e),
+            }
+        }
+    }
+}
+
+/// Lists Azure blobs with automatic credential refresh on failure
+unsafe fn list_blobs_with_retry(
+    rt: &tokio::runtime::Runtime,
+) -> std::result::Result<Vec<String>, Box<dyn std::error::Error + Send + Sync>> {
+    let sas = CONTAINER_SAS_URL.clone().ok_or("No SAS URL configured")?;
+
+    match rt.block_on(list_azure_blobs(&sas)) {
+        Ok(result) => Ok(result),
+        Err(e) => {
+            eprintln!("[Retry] List blobs failed: {}, attempting credential refresh...", e);
+            match refresh_credentials(rt) {
+                Some(new_sas) => rt.block_on(list_azure_blobs(&new_sas)),
+                None => Err(e),
+            }
+        }
+    }
+}
+
 fn main() -> Result<()> {
     // Check for file path argument, otherwise default to notes.txt
     let args: Vec<String> = std::env::args().collect();
@@ -204,6 +388,39 @@ fn main() -> Result<()> {
         }
     }
     
+    // Try loading refresh token from Credential Manager if we don't have one yet
+    let has_refresh = unsafe { REFRESH_TOKEN.is_some() };
+    let has_sas = unsafe { CONTAINER_SAS_URL.is_some() };
+    if !has_sas && !has_refresh {
+        if let Some(saved_token) = load_refresh_token() {
+            unsafe { REFRESH_TOKEN = Some(saved_token); }
+        }
+    }
+    
+    // If we have a refresh token but no SAS URL, try to get one
+    let has_refresh = unsafe { REFRESH_TOKEN.is_some() };
+    let has_sas = unsafe { CONTAINER_SAS_URL.is_some() };
+    if !has_sas && has_refresh {
+        println!("[Main] Have refresh token, trying to get SAS URL...");
+        let rt = tokio::runtime::Runtime::new().expect("Failed to create Tokio runtime");
+        let token = unsafe { REFRESH_TOKEN.clone().unwrap() };
+        match rt.block_on(call_get_url(&token)) {
+            Ok((sas_url, new_token)) => {
+                println!("[Main] Successfully obtained SAS URL from saved token");
+                unsafe { CONTAINER_SAS_URL = Some(sas_url); }
+                if let Some(t) = new_token {
+                    save_refresh_token(&t);
+                    unsafe { REFRESH_TOKEN = Some(t); }
+                }
+            }
+            Err(e) => {
+                eprintln!("[Main] Failed to get SAS URL from saved token: {}", e);
+                delete_refresh_token();
+                unsafe { REFRESH_TOKEN = None; }
+            }
+        }
+    }
+    
     // If no SAS URL is set, show login dialog
     let has_sas = unsafe { CONTAINER_SAS_URL.is_some() };
     if !has_sas {
@@ -222,13 +439,12 @@ fn main() -> Result<()> {
     }
 
     // Fetch content from Azure Blob Storage before starting the GUI
-    let sas_url = unsafe { CONTAINER_SAS_URL.clone() };
-    println!("[Main] SAS URL after login: {}", if sas_url.is_some() { "present" } else { "missing" });
-    if let Some(ref sas) = sas_url {
+    println!("[Main] SAS URL after login: {}", if unsafe { CONTAINER_SAS_URL.is_some() } { "present" } else { "missing" });
+    if unsafe { CONTAINER_SAS_URL.is_some() } {
         println!("[Main] Creating Tokio runtime...");
         let rt = tokio::runtime::Runtime::new().expect("Failed to create Tokio runtime");
         println!("[Main] Fetching notes from Azure...");
-        match rt.block_on(fetch_notes_from_azure(sas, &file_name)) {
+        match unsafe { fetch_notes_with_retry(&rt, &file_name) } {
             Ok((remote_content, remote_modified)) => {
                 println!("[Main] Successfully fetched {} bytes from Azure", remote_content.len());
                 
@@ -469,11 +685,11 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                     }
                     
                     // Upload to Azure Blob Storage if SAS URL is configured
-                    if let Some(ref sas) = CONTAINER_SAS_URL {
+                    if CONTAINER_SAS_URL.is_some() {
                         let key = get_current_key();
                         println!("[Save] Uploading to Azure with key '{}'...", key);
                         let rt = tokio::runtime::Runtime::new().expect("Failed to create Tokio runtime");
-                        match rt.block_on(upload_notes_to_azure(sas, &key, &text)) {
+                        match upload_notes_with_retry(&rt, &key, &text) {
                             Ok(_) => println!("[Save] Successfully uploaded to Azure"),
                             Err(e) => eprintln!("[Save] Failed to upload to Azure: {}", e),
                         }
@@ -552,9 +768,9 @@ unsafe fn show_save_as_dialog(hwnd: HWND) {
     }
     
     // Upload to Azure if SAS URL is configured
-    if let Some(ref sas) = CONTAINER_SAS_URL {
+    if CONTAINER_SAS_URL.is_some() {
         let rt = tokio::runtime::Runtime::new().expect("Failed to create Tokio runtime");
-        if let Err(e) = rt.block_on(upload_notes_to_azure(sas, &new_filename, &text)) {
+        if let Err(e) = upload_notes_with_retry(&rt, &new_filename, &text) {
             eprintln!("[SaveAs] Azure upload failed: {}", e);
         }
     }
@@ -627,13 +843,12 @@ unsafe fn show_new_file_dialog() {
     let local_modified = std::fs::metadata(&new_path).ok().and_then(|m| m.modified().ok());
     
     // Check Azure for existing file
-    let sas_url = CONTAINER_SAS_URL.clone();
     let mut remote_content: Option<String> = None;
     let mut remote_modified: Option<SystemTime> = None;
     
-    if let Some(ref sas) = sas_url {
+    if CONTAINER_SAS_URL.is_some() {
         let rt = tokio::runtime::Runtime::new().expect("Failed to create Tokio runtime");
-        match rt.block_on(fetch_notes_from_azure(sas, &new_filename)) {
+        match fetch_notes_with_retry(&rt, &new_filename) {
             Ok((content, modified)) => {
                 remote_content = Some(content);
                 remote_modified = modified;
@@ -654,9 +869,9 @@ unsafe fn show_new_file_dialog() {
                 eprintln!("[NewFile] Failed to create file: {}", e);
                 return;
             }
-            if let Some(ref sas) = sas_url {
+            if CONTAINER_SAS_URL.is_some() {
                 let rt = tokio::runtime::Runtime::new().expect("Failed to create Tokio runtime");
-                if let Err(e) = rt.block_on(upload_notes_to_azure(sas, &new_filename, "")) {
+                if let Err(e) = upload_notes_with_retry(&rt, &new_filename, "") {
                     eprintln!("[NewFile] Azure upload failed: {}", e);
                 }
             }
@@ -1121,33 +1336,18 @@ unsafe fn perform_login(hwnd: HWND, link_code: Option<String>) {
             }) {
                 Ok(refresh_token) => {
                     println!("[Login] Refresh token: {}", refresh_token);
+                    save_refresh_token(&refresh_token);
+                    REFRESH_TOKEN = Some(refresh_token.clone());
 
                     // Call get_url with the refresh token
-                    match rt.block_on(async {
-                        let client = reqwest::Client::new();
-                        let resp = client
-                            .post("https://notes-auth-func.azurewebsites.net/api/get_url")
-                            .body(refresh_token)
-                            .send()
-                            .await?;
-                        resp.text().await
-                    }) {
-                        Ok(url_response) => {
-                            println!("[Login] get_url response: {}", url_response);
-                            match serde_json::from_str::<serde_json::Value>(&url_response) {
-                                Ok(json) => {
-                                    if let Some(new_token) = json.get("refresh_token").and_then(|v| v.as_str()) {
-                                        println!("[Login] New refresh token: {}", new_token);
-                                        REFRESH_TOKEN = Some(new_token.to_string());
-                                    }
-                                    if let Some(url) = json.get("url").and_then(|v| v.as_str()) {
-                                        println!("[Login] Container SAS URL: {}", url);
-                                        CONTAINER_SAS_URL = Some(url.to_string());
-                                    }
-                                }
-                                Err(e) => {
-                                    eprintln!("[Login] Failed to parse get_url response: {}", e);
-                                }
+                    match rt.block_on(call_get_url(&refresh_token)) {
+                        Ok((sas_url, new_token)) => {
+                            println!("[Login] Container SAS URL: {}", sas_url);
+                            CONTAINER_SAS_URL = Some(sas_url);
+                            if let Some(t) = new_token {
+                                println!("[Login] New refresh token: {}", t);
+                                save_refresh_token(&t);
+                                REFRESH_TOKEN = Some(t);
                             }
                         }
                         Err(e) => {
@@ -1226,17 +1426,14 @@ unsafe extern "system" fn login_dlg_proc(hwnd: HWND, msg: u32, wparam: WPARAM, l
 
 /// Shows the Azure blob picker dialog and opens the selected file in a new window
 unsafe fn show_open_file_dialog() {
-    let sas_url = match CONTAINER_SAS_URL.clone() {
-        Some(url) => url,
-        None => {
-            eprintln!("[OpenFile] No Azure SAS URL configured");
-            return;
-        }
-    };
+    if CONTAINER_SAS_URL.is_none() {
+        eprintln!("[OpenFile] No Azure SAS URL configured");
+        return;
+    }
 
     // List blobs from Azure
     let rt = tokio::runtime::Runtime::new().expect("Failed to create Tokio runtime");
-    let keys = match rt.block_on(list_azure_blobs(&sas_url)) {
+    let keys = match list_blobs_with_retry(&rt) {
         Ok(keys) => keys,
         Err(e) => {
             eprintln!("[OpenFile] Failed to list Azure blobs: {}", e);
@@ -1303,7 +1500,7 @@ unsafe fn show_open_file_dialog() {
     let mut remote_content: Option<String> = None;
     let mut remote_modified: Option<SystemTime> = None;
 
-    match rt.block_on(fetch_notes_from_azure(&sas_url, &selected_key)) {
+    match fetch_notes_with_retry(&rt, &selected_key) {
         Ok((content, modified)) => {
             remote_content = Some(content);
             remote_modified = modified;

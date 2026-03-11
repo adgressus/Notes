@@ -26,4 +26,5 @@ features = [
     "Win32_System_LibraryLoader",
     "Win32_System_SystemInformation",
     "Win32_UI_Controls_Dialogs",
+    "Win32_Security_Credentials",
 ]
