@@ -50,7 +50,7 @@ pub async fn login_with_microsoft(nonce: &str) -> Result<TokenResponse, Box<dyn 
     let listener = TcpListener::bind("127.0.0.1:0")?;
     let port = listener.local_addr()?.port();
     let redirect_uri = format!("http://localhost:{}", port);
-    println!("[Auth] Listening for redirect on {}", redirect_uri);
+    log::info!("Listening for redirect on {}", redirect_uri);
 
     // Generate PKCE code verifier and challenge
     let code_verifier = generate_code_verifier();
@@ -68,34 +68,34 @@ pub async fn login_with_microsoft(nonce: &str) -> Result<TokenResponse, Box<dyn 
         percent_encode(nonce),
     );
 
-    println!("[Auth] Opening browser for Microsoft login...");
+    log::info!("Opening browser for Microsoft login...");
     open_browser(&auth_url)?;
 
     // Wait for the redirect (blocking)
-    println!("[Auth] Waiting for authorization callback...");
+    log::info!("Waiting for authorization callback...");
     let auth_code = wait_for_auth_code(&listener)?;
-    println!(
-        "[Auth] Received authorization code: {}...",
+    log::debug!(
+        "Received authorization code: {}...",
         &auth_code[..10.min(auth_code.len())]
     );
 
     // Exchange authorization code for tokens
-    println!("[Auth] Exchanging code for tokens...");
+    log::info!("Exchanging code for tokens...");
     let token = exchange_code_for_token(&client_id, &auth_code, &redirect_uri, &code_verifier).await?;
 
     // Verify and decode the id_token
     if let Some(ref id_token) = token.id_token {
-        println!("[Auth] Verifying id_token signature with Microsoft's public keys...");
+        log::debug!("Verifying id_token signature with Microsoft's public keys...");
         match verify_and_decode_id_token(id_token, &client_id).await {
             Ok(claims) => {
-                println!("[Auth] --- ID Token Claims (verified) ---");
+                log::debug!("--- ID Token Claims (verified) ---");
                 for (key, value) in claims.as_object().unwrap_or(&serde_json::Map::new()) {
-                    println!("[Auth]   {} = {}", key, value);
+                    log::debug!("  {} = {}", key, value);
                 }
-                println!("[Auth] --- End ID Token Claims ---");
+                log::debug!("--- End ID Token Claims ---");
             }
             Err(e) => {
-                eprintln!("[Auth] WARNING: id_token verification failed: {}", e);
+                log::warn!("id_token verification failed: {}", e);
             }
         }
     }
@@ -148,7 +148,7 @@ fn wait_for_auth_code(listener: &TcpListener) -> Result<String, Box<dyn std::err
     reader.read_line(&mut request_line)?;
 
     // Log the full request line
-    println!("[Auth] Raw redirect request: {}", request_line.trim());
+    log::debug!("Raw redirect request: {}", request_line.trim());
 
     // Read and log all headers
     loop {
@@ -157,7 +157,7 @@ fn wait_for_auth_code(listener: &TcpListener) -> Result<String, Box<dyn std::err
         if header_line.trim().is_empty() {
             break;
         }
-        println!("[Auth] Header: {}", header_line.trim());
+        log::debug!("Header: {}", header_line.trim());
     }
 
     // Parse "GET /?code=...&state=... HTTP/1.1"
@@ -168,14 +168,14 @@ fn wait_for_auth_code(listener: &TcpListener) -> Result<String, Box<dyn std::err
 
     // Log all query parameters
     if let Some(query) = path.split('?').nth(1) {
-        println!("[Auth] --- Query parameters ---");
+        log::debug!("--- Query parameters ---");
         for pair in query.split('&') {
             let mut parts = pair.splitn(2, '=');
             if let (Some(key), Some(value)) = (parts.next(), parts.next()) {
-                println!("[Auth]   {} = {}", key, percent_decode(value));
+                log::debug!("  {} = {}", key, percent_decode(value));
             }
         }
-        println!("[Auth] --- End query parameters ---");
+        log::debug!("--- End query parameters ---");
     }
 
     // Check for error response
@@ -279,8 +279,8 @@ async fn exchange_code_for_token(
 
     let status = response.status();
     let body_text = response.text().await?;
-    println!("[Auth] Token response status: {}", status);
-    println!("[Auth] Token response body: {}", body_text);
+    log::debug!("Token response status: {}", status);
+    log::debug!("Token response body: {}", body_text);
 
     if !status.is_success() {
         return Err(format!("Token exchange failed: {}", body_text).into());
@@ -316,7 +316,7 @@ async fn verify_and_decode_id_token(
     // Decode the JWT header to get the key ID (kid)
     let header = jsonwebtoken::decode_header(id_token)?;
     let kid = header.kid.ok_or("id_token header missing 'kid'")?;
-    println!("[Auth] id_token key ID (kid): {}", kid);
+    log::debug!("id_token key ID (kid): {}", kid);
 
     // Fetch Microsoft's public keys
     let client = reqwest::Client::new();
@@ -351,7 +351,7 @@ async fn verify_and_decode_id_token(
         if !iss.starts_with("https://login.microsoftonline.com/") {
             return Err(format!("Invalid issuer: {}", iss).into());
         }
-        println!("[Auth] Issuer verified: {}", iss);
+        log::debug!("Issuer verified: {}", iss);
     }
 
     Ok(token_data.claims)

@@ -13,6 +13,8 @@ base64 = "0.22"
 sha2 = "0.10"
 jsonwebtoken = "9"
 httpdate = "1"
+log = "0.4"
+winlog = "0.2"
 
 [dependencies.windows]
 version = "0.58"

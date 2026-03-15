@@ -42,9 +42,9 @@ fn save_refresh_token(token: &str) {
     };
     unsafe {
         if let Err(e) = CredWriteW(&cred, 0) {
-            eprintln!("[Cred] Failed to save refresh token: {}", e);
+            log::error!("Failed to save refresh token: {}", e);
         } else {
-            println!("[Cred] Refresh token saved to Credential Manager");
+            log::info!("Refresh token saved to Credential Manager");
         }
     }
 }
@@ -59,10 +59,10 @@ fn load_refresh_token() -> Option<String> {
             let blob = std::slice::from_raw_parts(cred.CredentialBlob, cred.CredentialBlobSize as usize);
             let token = String::from_utf8_lossy(blob).to_string();
             CredFree(cred_ptr as *const _);
-            println!("[Cred] Loaded refresh token from Credential Manager");
+            log::info!("Loaded refresh token from Credential Manager");
             Some(token)
         } else {
-            println!("[Cred] No saved refresh token found");
+            log::debug!("No saved refresh token found");
             None
         }
     }
@@ -73,7 +73,7 @@ fn delete_refresh_token() {
     let target_wide: Vec<u16> = CREDENTIAL_TARGET.encode_utf16().chain(std::iter::once(0)).collect();
     unsafe {
         let _ = CredDeleteW(PCWSTR(target_wide.as_ptr()), CRED_TYPE_GENERIC, 0);
-        println!("[Cred] Refresh token deleted from Credential Manager");
+        log::info!("Refresh token deleted from Credential Manager");
     }
 }
 
@@ -105,7 +105,7 @@ fn build_list_url(container_sas_url: &str) -> String {
 /// Returns the content and the last modified timestamp
 async fn fetch_notes_from_azure(container_sas_url: &str, blob_name: &str) -> std::result::Result<(String, Option<SystemTime>), Box<dyn std::error::Error + Send + Sync>> {
     let blob_url = build_blob_url(container_sas_url, blob_name);
-    println!("[Azure] Fetching blob '{}'", blob_name);
+    log::info!("Fetching blob '{}'", blob_name);
 
     let client = reqwest::Client::new();
     let response = client.get(&blob_url)
@@ -126,10 +126,10 @@ async fn fetch_notes_from_azure(container_sas_url: &str, blob_name: &str) -> std
             // Format: "Thu, 01 Jan 2026 00:00:00 GMT"
             httpdate::parse_http_date(s).ok()
         });
-    println!("[Azure] Last modified: {:?}", last_modified);
+    log::debug!("Last modified: {:?}", last_modified);
 
     let content = response.text().await?;
-    println!("[Azure] Content fetched successfully, {} bytes", content.len());
+    log::info!("Content fetched successfully, {} bytes", content.len());
 
     Ok((content, last_modified))
 }
@@ -167,7 +167,7 @@ fn read_local_notes() -> Option<String> {
 /// Lists all blobs in the Azure Blob container using the SAS URL
 async fn list_azure_blobs(container_sas_url: &str) -> std::result::Result<Vec<String>, Box<dyn std::error::Error + Send + Sync>> {
     let list_url = build_list_url(container_sas_url);
-    println!("[Azure List] Listing blobs...");
+    log::info!("Listing blobs...");
 
     let client = reqwest::Client::new();
     let response = client.get(&list_url)
@@ -192,14 +192,14 @@ async fn list_azure_blobs(container_sas_url: &str) -> std::result::Result<Vec<St
         }
     }
 
-    println!("[Azure List] Found {} blobs", names.len());
+    log::info!("Found {} blobs", names.len());
     Ok(names)
 }
 
 /// Uploads content to Azure Blob Storage using the container SAS URL
 async fn upload_notes_to_azure(container_sas_url: &str, blob_name: &str, content: &str) -> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let blob_url = build_blob_url(container_sas_url, blob_name);
-    println!("[Azure Upload] Uploading blob '{}'", blob_name);
+    log::info!("Uploading blob '{}'", blob_name);
 
     let client = reqwest::Client::new();
     let response = client.put(&blob_url)
@@ -216,13 +216,13 @@ async fn upload_notes_to_azure(container_sas_url: &str, blob_name: &str, content
         return Err(format!("Azure upload failed ({}): {}", status, body).into());
     }
 
-    println!("[Azure Upload] Upload successful");
+    log::info!("Upload successful");
     Ok(())
 }
 
 /// Calls the get_url endpoint to exchange a refresh token for a new SAS URL
 async fn call_get_url(refresh_token: &str) -> std::result::Result<(String, Option<String>), Box<dyn std::error::Error + Send + Sync>> {
-    println!("[GetURL] Calling get_url with refresh token...");
+    log::debug!("Calling get_url with refresh token...");
     let client = reqwest::Client::new();
     let resp = client
         .post("https://notes-auth-func.azurewebsites.net/api/get_url")
@@ -248,7 +248,7 @@ async fn call_get_url(refresh_token: &str) -> std::result::Result<(String, Optio
         .and_then(|v| v.as_str())
         .map(|s| s.to_string());
 
-    println!("[GetURL] Successfully obtained new SAS URL");
+    log::info!("Successfully obtained new SAS URL");
     Ok((url, new_token))
 }
 
@@ -256,14 +256,14 @@ async fn call_get_url(refresh_token: &str) -> std::result::Result<(String, Optio
 /// then falls back to showing the login dialog.
 /// Returns the new SAS URL if successful, or None if the user cancels.
 unsafe fn refresh_credentials(rt: &tokio::runtime::Runtime) -> Option<String> {
-    println!("[Refresh] Attempting to refresh credentials...");
+    log::info!("Attempting to refresh credentials...");
 
     // Step 1: Try to get a new URL using the refresh token
     if let Some(ref token) = REFRESH_TOKEN {
-        println!("[Refresh] Trying get_url with existing refresh token...");
+        log::debug!("Trying get_url with existing refresh token...");
         match rt.block_on(call_get_url(token)) {
             Ok((new_sas, new_token)) => {
-                println!("[Refresh] Successfully refreshed SAS URL");
+                log::info!("Successfully refreshed SAS URL");
                 CONTAINER_SAS_URL = Some(new_sas.clone());
                 if let Some(t) = new_token {
                     save_refresh_token(&t);
@@ -272,15 +272,15 @@ unsafe fn refresh_credentials(rt: &tokio::runtime::Runtime) -> Option<String> {
                 return Some(new_sas);
             }
             Err(e) => {
-                eprintln!("[Refresh] Failed to refresh SAS URL: {}", e);
+                log::error!("Failed to refresh SAS URL: {}", e);
             }
         }
     } else {
-        println!("[Refresh] No refresh token available, skipping get_url");
+        log::info!("No refresh token available, skipping get_url");
     }
 
     // Step 2: Show login dialog to re-authenticate
-    println!("[Refresh] Showing login dialog for re-authentication...");
+    log::info!("Showing login dialog for re-authentication...");
     let template = build_login_dialog_template();
     let instance = GetModuleHandleW(None).unwrap_or_default();
     DialogBoxIndirectParamW(
@@ -305,7 +305,7 @@ unsafe fn fetch_notes_with_retry(
     match rt.block_on(fetch_notes_from_azure(&sas, blob_name)) {
         Ok(result) => Ok(result),
         Err(e) => {
-            eprintln!("[Retry] Fetch failed: {}, attempting credential refresh...", e);
+            log::warn!("Fetch failed, attempting credential refresh: {}", e);
             match refresh_credentials(rt) {
                 Some(new_sas) => rt.block_on(fetch_notes_from_azure(&new_sas, blob_name)),
                 None => Err(e),
@@ -325,7 +325,7 @@ unsafe fn upload_notes_with_retry(
     match rt.block_on(upload_notes_to_azure(&sas, blob_name, content)) {
         Ok(result) => Ok(result),
         Err(e) => {
-            eprintln!("[Retry] Upload failed: {}, attempting credential refresh...", e);
+            log::warn!("Upload failed, attempting credential refresh: {}", e);
             match refresh_credentials(rt) {
                 Some(new_sas) => rt.block_on(upload_notes_to_azure(&new_sas, blob_name, content)),
                 None => Err(e),
@@ -343,7 +343,7 @@ unsafe fn list_blobs_with_retry(
     match rt.block_on(list_azure_blobs(&sas)) {
         Ok(result) => Ok(result),
         Err(e) => {
-            eprintln!("[Retry] List blobs failed: {}, attempting credential refresh...", e);
+            log::warn!("List blobs failed, attempting credential refresh: {}", e);
             match refresh_credentials(rt) {
                 Some(new_sas) => rt.block_on(list_azure_blobs(&new_sas)),
                 None => Err(e),
@@ -353,6 +353,9 @@ unsafe fn list_blobs_with_retry(
 }
 
 fn main() -> Result<()> {
+    // Initialize Windows Event Log logging
+    winlog::init("Notes").unwrap();
+
     // Check for file path argument, otherwise default to notes.txt
     let args: Vec<String> = std::env::args().collect();
     let (file_path, file_name) = if args.len() > 1 {
@@ -372,13 +375,13 @@ fn main() -> Result<()> {
         CURRENT_FILE_NAME = Some(file_name.clone());
     }
     
-    println!("[Main] File path: {:?}", file_path);
-    println!("[Main] File name: {}", file_name);
+    log::info!("File path: {:?}", file_path);
+    log::info!("File name: {}", file_name);
     
     // Check if SAS URL was passed via environment variable (from parent process)
     if let Ok(sas) = std::env::var("NOTES_SAS_URL") {
         if !sas.is_empty() {
-            println!("[Main] Found SAS URL from environment");
+            log::info!("Found SAS URL from environment");
             unsafe { CONTAINER_SAS_URL = Some(sas); }
         }
     }
@@ -401,12 +404,12 @@ fn main() -> Result<()> {
     let has_refresh = unsafe { REFRESH_TOKEN.is_some() };
     let has_sas = unsafe { CONTAINER_SAS_URL.is_some() };
     if !has_sas && has_refresh {
-        println!("[Main] Have refresh token, trying to get SAS URL...");
+        log::info!("Have refresh token, trying to get SAS URL...");
         let rt = tokio::runtime::Runtime::new().expect("Failed to create Tokio runtime");
         let token = unsafe { REFRESH_TOKEN.clone().unwrap() };
         match rt.block_on(call_get_url(&token)) {
             Ok((sas_url, new_token)) => {
-                println!("[Main] Successfully obtained SAS URL from saved token");
+                log::info!("Successfully obtained SAS URL from saved token");
                 unsafe { CONTAINER_SAS_URL = Some(sas_url); }
                 if let Some(t) = new_token {
                     save_refresh_token(&t);
@@ -414,7 +417,7 @@ fn main() -> Result<()> {
                 }
             }
             Err(e) => {
-                eprintln!("[Main] Failed to get SAS URL from saved token: {}", e);
+                log::error!("Failed to get SAS URL from saved token: {}", e);
                 delete_refresh_token();
                 unsafe { REFRESH_TOKEN = None; }
             }
@@ -424,7 +427,7 @@ fn main() -> Result<()> {
     // If no SAS URL is set, show login dialog
     let has_sas = unsafe { CONTAINER_SAS_URL.is_some() };
     if !has_sas {
-        println!("[Main] No Azure SAS URL, showing login dialog");
+        log::info!("No Azure SAS URL, showing login dialog");
         unsafe {
             let template = build_login_dialog_template();
             let instance = GetModuleHandleW(None).unwrap_or_default();
@@ -439,45 +442,45 @@ fn main() -> Result<()> {
     }
 
     // Fetch content from Azure Blob Storage before starting the GUI
-    println!("[Main] SAS URL after login: {}", if unsafe { CONTAINER_SAS_URL.is_some() } { "present" } else { "missing" });
+    log::info!("SAS URL after login: {}", if unsafe { CONTAINER_SAS_URL.is_some() } { "present" } else { "missing" });
     if unsafe { CONTAINER_SAS_URL.is_some() } {
-        println!("[Main] Creating Tokio runtime...");
+        log::debug!("Creating Tokio runtime...");
         let rt = tokio::runtime::Runtime::new().expect("Failed to create Tokio runtime");
-        println!("[Main] Fetching notes from Azure...");
+        log::info!("Fetching notes from Azure...");
         match unsafe { fetch_notes_with_retry(&rt, &file_name) } {
             Ok((remote_content, remote_modified)) => {
-                println!("[Main] Successfully fetched {} bytes from Azure", remote_content.len());
+                log::info!("Successfully fetched {} bytes from Azure", remote_content.len());
                 
                 // Compare timestamps to decide which source to use
                 let local_modified = get_local_file_modified_time();
-                println!("[Main] Local file last modified: {:?}", local_modified);
+                log::debug!("Local file last modified: {:?}", local_modified);
                 
                 let use_remote = match (remote_modified, local_modified) {
                     (Some(remote_time), Some(local_time)) => {
                         if remote_time > local_time {
-                            println!("[Main] Remote is newer, using remote content and overwriting local file");
+                            log::info!("Remote is newer, using remote content and overwriting local file");
                             if let Some(path) = get_notes_path() {
                                 if let Err(e) = std::fs::write(&path, &remote_content) {
-                                    eprintln!("[Main] Failed to overwrite local file: {}", e);
+                                    log::error!("Failed to overwrite local file: {}", e);
                                 }
                             }
                             true
                         } else {
-                            println!("[Main] Local file is newer or same age, using local content");
+                            log::info!("Local file is newer or same age, using local content");
                             false
                         }
                     }
                     (Some(_), None) => {
-                        println!("[Main] No local file exists, using remote content");
+                        log::info!("No local file exists, using remote content");
                         if let Some(path) = get_notes_path() {
                             if let Err(e) = std::fs::write(&path, &remote_content) {
-                                eprintln!("[Main] Failed to save remote content to local file: {}", e);
+                                log::error!("Failed to save remote content to local file: {}", e);
                             }
                         }
                         true
                     }
                     _ => {
-                        println!("[Main] Could not determine remote timestamp, using remote content");
+                        log::info!("Could not determine remote timestamp, using remote content");
                         true
                     }
                 };
@@ -491,15 +494,15 @@ fn main() -> Result<()> {
                 unsafe { INITIAL_CONTENT = Some(content); }
             }
             Err(e) => {
-                eprintln!("[Main] ERROR: Failed to fetch notes from Azure: {}", e);
+                log::error!("Failed to fetch notes from Azure: {}", e);
                 if let Some(content) = read_local_notes() {
-                    println!("[Main] Falling back to local file");
+                    log::info!("Falling back to local file");
                     unsafe { INITIAL_CONTENT = Some(content); }
                 }
             }
         }
     } else {
-        println!("[Main] No SAS URL available, reading local file only");
+        log::info!("No SAS URL available, reading local file only");
         if let Some(content) = read_local_notes() {
             unsafe { INITIAL_CONTENT = Some(content); }
         }
@@ -678,20 +681,20 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                     // Save to current file path
                     if let Some(path) = get_notes_path() {
                         if let Err(e) = std::fs::write(&path, &text) {
-                            eprintln!("[Save] Failed to save notes: {}", e);
+                            log::error!("Failed to save notes: {}", e);
                         } else {
-                            println!("[Save] Notes saved to {:?}", path);
+                            log::info!("Notes saved to {:?}", path);
                         }
                     }
                     
                     // Upload to Azure Blob Storage if SAS URL is configured
                     if CONTAINER_SAS_URL.is_some() {
                         let key = get_current_key();
-                        println!("[Save] Uploading to Azure with key '{}'...", key);
+                        log::info!("Uploading to Azure with key '{}'...", key);
                         let rt = tokio::runtime::Runtime::new().expect("Failed to create Tokio runtime");
                         match upload_notes_with_retry(&rt, &key, &text) {
-                            Ok(_) => println!("[Save] Successfully uploaded to Azure"),
-                            Err(e) => eprintln!("[Save] Failed to upload to Azure: {}", e),
+                            Ok(_) => log::info!("Successfully uploaded to Azure"),
+                            Err(e) => log::error!("Failed to upload to Azure: {}", e),
                         }
                     }
                 }
@@ -743,7 +746,7 @@ unsafe fn show_save_as_dialog(hwnd: HWND) {
         .map(|s| s.to_string_lossy().to_string())
         .unwrap_or_else(|| "notes.txt".to_string());
     
-    println!("[SaveAs] New path: {:?}, New filename: {}", new_path, new_filename);
+    log::info!("SaveAs: new path {:?}, filename {}", new_path, new_filename);
     
     // Update global state and window title
     CURRENT_FILE_PATH = Some(new_path.clone());
@@ -762,16 +765,16 @@ unsafe fn show_save_as_dialog(hwnd: HWND) {
     let text = String::from_utf16_lossy(&buffer[..text_len]);
     
     if let Err(e) = std::fs::write(&new_path, &text) {
-        eprintln!("[SaveAs] Failed to save: {}", e);
+        log::error!("SaveAs: failed to save: {}", e);
     } else {
-        println!("[SaveAs] Saved to {:?}", new_path);
+        log::info!("SaveAs: saved to {:?}", new_path);
     }
     
     // Upload to Azure if SAS URL is configured
     if CONTAINER_SAS_URL.is_some() {
         let rt = tokio::runtime::Runtime::new().expect("Failed to create Tokio runtime");
         if let Err(e) = upload_notes_with_retry(&rt, &new_filename, &text) {
-            eprintln!("[SaveAs] Azure upload failed: {}", e);
+            log::error!("SaveAs: Azure upload failed: {}", e);
         }
     }
 }
@@ -805,7 +808,7 @@ unsafe fn show_new_file_dialog() {
     let notes_dir = match std::env::var("USERPROFILE") {
         Ok(home) => std::path::Path::new(&home).join("Notes"),
         Err(_) => {
-            eprintln!("[NewFile] USERPROFILE not set");
+            log::error!("USERPROFILE not set");
             return;
         }
     };
@@ -813,7 +816,7 @@ unsafe fn show_new_file_dialog() {
     // Create Notes directory if it doesn't exist
     if !notes_dir.exists() {
         if let Err(e) = std::fs::create_dir_all(&notes_dir) {
-            eprintln!("[NewFile] Failed to create Notes directory: {}", e);
+            log::error!("Failed to create Notes directory: {}", e);
             return;
         }
     }
@@ -836,7 +839,7 @@ unsafe fn show_new_file_dialog() {
         (new_path, new_filename)
     };
     
-    println!("[NewFile] Opening file: {:?}", new_path);
+    log::info!("Opening file: {:?}", new_path);
     
     // Check if local file exists and get its modification time
     let local_exists = new_path.exists();
@@ -852,10 +855,10 @@ unsafe fn show_new_file_dialog() {
             Ok((content, modified)) => {
                 remote_content = Some(content);
                 remote_modified = modified;
-                println!("[NewFile] Found Azure blob, modified: {:?}", remote_modified);
+                log::debug!("Found Azure blob, modified: {:?}", remote_modified);
             }
             Err(e) => {
-                println!("[NewFile] No Azure blob found or error: {}", e);
+                log::debug!("No Azure blob found or error: {}", e);
             }
         }
     }
@@ -864,28 +867,28 @@ unsafe fn show_new_file_dialog() {
     match (local_exists, remote_content.is_some()) {
         (false, false) => {
             // Neither exists - create new empty file locally and in Azure
-            println!("[NewFile] Creating new empty file");
+            log::info!("Creating new empty file");
             if let Err(e) = std::fs::write(&new_path, "") {
-                eprintln!("[NewFile] Failed to create file: {}", e);
+                log::error!("Failed to create file: {}", e);
                 return;
             }
             if CONTAINER_SAS_URL.is_some() {
                 let rt = tokio::runtime::Runtime::new().expect("Failed to create Tokio runtime");
                 if let Err(e) = upload_notes_with_retry(&rt, &new_filename, "") {
-                    eprintln!("[NewFile] Azure upload failed: {}", e);
+                    log::error!("Azure upload failed: {}", e);
                 }
             }
         }
         (true, false) => {
             // Local exists, no remote - use local as-is
-            println!("[NewFile] Using existing local file (no remote version)");
+            log::info!("Using existing local file (no remote version)");
         }
         (false, true) => {
             // Remote exists, no local - download from Azure
-            println!("[NewFile] Downloading from Azure (no local file)");
+            log::info!("Downloading from Azure (no local file)");
             if let Some(content) = &remote_content {
                 if let Err(e) = std::fs::write(&new_path, content) {
-                    eprintln!("[NewFile] Failed to save remote content locally: {}", e);
+                    log::error!("Failed to save remote content locally: {}", e);
                 }
             }
         }
@@ -893,15 +896,15 @@ unsafe fn show_new_file_dialog() {
             // Both exist - compare timestamps
             match (remote_modified, local_modified) {
                 (Some(remote_time), Some(local_time)) if remote_time > local_time => {
-                    println!("[NewFile] Remote is newer, overwriting local file");
+                    log::info!("Remote is newer, overwriting local file");
                     if let Some(content) = &remote_content {
                         if let Err(e) = std::fs::write(&new_path, content) {
-                            eprintln!("[NewFile] Failed to overwrite local file: {}", e);
+                            log::error!("Failed to overwrite local file: {}", e);
                         }
                     }
                 }
                 _ => {
-                    println!("[NewFile] Local file is newer or same age, using local");
+                    log::info!("Local file is newer or same age, using local");
                 }
             }
         }
@@ -921,8 +924,8 @@ unsafe fn show_new_file_dialog() {
         cmd.env("NOTES_REFRESH_TOKEN", token);
     }
     match cmd.spawn() {
-        Ok(_) => println!("[NewFile] Spawned new window for {:?}", new_path),
-        Err(e) => eprintln!("[NewFile] Failed to spawn new window: {}", e),
+        Ok(_) => log::info!("Spawned new window for {:?}", new_path),
+        Err(e) => log::error!("Failed to spawn new window: {}", e),
     }
 }
 
@@ -1292,7 +1295,7 @@ unsafe fn perform_login(hwnd: HWND, link_code: Option<String>) {
         Some(code) => format!("https://notes-auth-func.azurewebsites.net/api/get_nonce?link_code={}", code),
         None => "https://notes-auth-func.azurewebsites.net/api/get_nonce".to_string(),
     };
-    println!("[Login] Fetching nonce from: {}", nonce_url);
+    log::info!("Fetching nonce from: {}", nonce_url);
 
     // Fetch nonce from Azure Function
     let nonce = match rt.block_on(async {
@@ -1300,11 +1303,11 @@ unsafe fn perform_login(hwnd: HWND, link_code: Option<String>) {
         resp.text().await
     }) {
         Ok(n) => {
-            println!("[Login] Received nonce: {}", n);
+            log::debug!("Received nonce: {}", n);
             n
         }
         Err(e) => {
-            eprintln!("[Login] Failed to fetch nonce: {}", e);
+            log::error!("Failed to fetch nonce: {}", e);
             let msg = format!("Failed to fetch nonce:\n{}\0", e);
             let msg_wide: Vec<u16> = msg.encode_utf16().collect();
             MessageBoxW(hwnd, PCWSTR(msg_wide.as_ptr()), w!("Login Error"), MB_OK | MB_ICONERROR);
@@ -1312,19 +1315,19 @@ unsafe fn perform_login(hwnd: HWND, link_code: Option<String>) {
         }
     };
 
-    println!("[Login] Starting OAuth2 flow with nonce...");
+    log::info!("Starting OAuth2 flow with nonce...");
     match rt.block_on(microsoft_auth::login_with_microsoft(&nonce)) {
         Ok(token_response) => {
-            println!("[Login] Successfully authenticated!");
-            println!("[Login] Access token: {}...", &token_response.access_token[..20.min(token_response.access_token.len())]);
+            log::info!("Successfully authenticated!");
+            log::debug!("Access token: {}...", &token_response.access_token[..20.min(token_response.access_token.len())]);
             if let Some(ref id_token) = token_response.id_token {
-                println!("[Login] ID token received ({} chars)", id_token.len());
+                log::debug!("ID token received ({} chars)", id_token.len());
             }
 
             // Send the id_token to the backend to exchange for AWS credentials
             let post_token = token_response.id_token.as_deref()
                 .unwrap_or(&token_response.access_token);
-            println!("[Login] Sending token to get_token endpoint...");
+            log::debug!("Sending token to get_token endpoint...");
             match rt.block_on(async {
                 let client = reqwest::Client::new();
                 let resp = client
@@ -1335,35 +1338,35 @@ unsafe fn perform_login(hwnd: HWND, link_code: Option<String>) {
                 resp.text().await
             }) {
                 Ok(refresh_token) => {
-                    println!("[Login] Refresh token: {}", refresh_token);
+                    log::debug!("Refresh token received");
                     save_refresh_token(&refresh_token);
                     REFRESH_TOKEN = Some(refresh_token.clone());
 
                     // Call get_url with the refresh token
                     match rt.block_on(call_get_url(&refresh_token)) {
                         Ok((sas_url, new_token)) => {
-                            println!("[Login] Container SAS URL: {}", sas_url);
+                            log::info!("Container SAS URL obtained");
                             CONTAINER_SAS_URL = Some(sas_url);
                             if let Some(t) = new_token {
-                                println!("[Login] New refresh token: {}", t);
+                                log::debug!("Refresh token rotated");
                                 save_refresh_token(&t);
                                 REFRESH_TOKEN = Some(t);
                             }
                         }
                         Err(e) => {
-                            eprintln!("[Login] Failed to call get_url: {}", e);
+                            log::error!("Failed to call get_url: {}", e);
                         }
                     }
                 }
                 Err(e) => {
-                    eprintln!("[Login] Failed to send token to get_token: {}", e);
+                    log::error!("Failed to send token to get_token: {}", e);
                 }
             }
 
             let _ = EndDialog(hwnd, 1);
         }
         Err(e) => {
-            eprintln!("[Login] Authentication failed: {}", e);
+            log::error!("Authentication failed: {}", e);
             let msg = format!("Authentication failed:\n{}\0", e);
             let msg_wide: Vec<u16> = msg.encode_utf16().collect();
             MessageBoxW(hwnd, PCWSTR(msg_wide.as_ptr()), w!("Login Error"), MB_OK | MB_ICONERROR);
@@ -1391,7 +1394,7 @@ unsafe extern "system" fn login_dlg_proc(hwnd: HWND, msg: u32, wparam: WPARAM, l
         WM_COMMAND => {
             let control_id = (wparam.0 & 0xFFFF) as i32;
             if control_id == IDC_LOGIN_BTN {
-                println!("[Login] Sign in with Microsoft clicked");
+                log::info!("Sign in with Microsoft clicked");
                 perform_login(hwnd, None);
                 0
             } else if control_id == IDC_LINK_ACCOUNTS_BTN {
@@ -1406,7 +1409,7 @@ unsafe extern "system" fn login_dlg_proc(hwnd: HWND, msg: u32, wparam: WPARAM, l
                     return 0;
                 }
 
-                println!("[Login] Link Accounts clicked with code: {}", link_code);
+                log::info!("Link Accounts clicked with code: {}", link_code);
                 perform_login(hwnd, Some(link_code));
                 0
             } else if control_id == IDC_LOGIN_CANCEL {
@@ -1427,7 +1430,7 @@ unsafe extern "system" fn login_dlg_proc(hwnd: HWND, msg: u32, wparam: WPARAM, l
 /// Shows the Azure blob picker dialog and opens the selected file in a new window
 unsafe fn show_open_file_dialog() {
     if CONTAINER_SAS_URL.is_none() {
-        eprintln!("[OpenFile] No Azure SAS URL configured");
+        log::error!("No Azure SAS URL configured");
         return;
     }
 
@@ -1436,13 +1439,13 @@ unsafe fn show_open_file_dialog() {
     let keys = match list_blobs_with_retry(&rt) {
         Ok(keys) => keys,
         Err(e) => {
-            eprintln!("[OpenFile] Failed to list Azure blobs: {}", e);
+            log::error!("Failed to list Azure blobs: {}", e);
             return;
         }
     };
 
     if keys.is_empty() {
-        println!("[OpenFile] No blobs found in Azure container");
+        log::info!("No blobs found in Azure container");
         return;
     }
 
@@ -1464,7 +1467,7 @@ unsafe fn show_open_file_dialog() {
     PICKER_KEYS = None;
 
     if result <= 0 {
-        println!("[OpenFile] Dialog cancelled or failed");
+        log::debug!("Dialog cancelled or failed");
         return;
     }
 
@@ -1473,20 +1476,20 @@ unsafe fn show_open_file_dialog() {
         None => return,
     };
 
-    println!("[OpenFile] Selected: {}", selected_key);
+    log::info!("Selected: {}", selected_key);
 
     // Resolve local path: USERPROFILE/Notes/<key>
     let notes_dir = match std::env::var("USERPROFILE") {
         Ok(home) => std::path::Path::new(&home).join("Notes"),
         Err(_) => {
-            eprintln!("[OpenFile] USERPROFILE not set");
+            log::error!("USERPROFILE not set");
             return;
         }
     };
 
     if !notes_dir.exists() {
         if let Err(e) = std::fs::create_dir_all(&notes_dir) {
-            eprintln!("[OpenFile] Failed to create Notes directory: {}", e);
+            log::error!("Failed to create Notes directory: {}", e);
             return;
         }
     }
@@ -1506,38 +1509,38 @@ unsafe fn show_open_file_dialog() {
             remote_modified = modified;
         }
         Err(e) => {
-            eprintln!("[OpenFile] Failed to fetch Azure content: {}", e);
+            log::error!("Failed to fetch Azure content: {}", e);
         }
     }
 
     match (local_exists, remote_content.is_some()) {
         (false, false) => {
-            println!("[OpenFile] Neither local nor remote content available");
+            log::warn!("Neither local nor remote content available");
             return;
         }
         (true, false) => {
-            println!("[OpenFile] Using existing local file");
+            log::info!("Using existing local file");
         }
         (false, true) => {
-            println!("[OpenFile] Downloading from Azure");
+            log::info!("Downloading from Azure");
             if let Some(content) = &remote_content {
                 if let Err(e) = std::fs::write(&new_path, content) {
-                    eprintln!("[OpenFile] Failed to save remote content locally: {}", e);
+                    log::error!("Failed to save remote content locally: {}", e);
                 }
             }
         }
         (true, true) => {
             match (remote_modified, local_modified) {
                 (Some(remote_time), Some(local_time)) if remote_time > local_time => {
-                    println!("[OpenFile] Remote is newer, overwriting local file");
+                    log::info!("Remote is newer, overwriting local file");
                     if let Some(content) = &remote_content {
                         if let Err(e) = std::fs::write(&new_path, content) {
-                            eprintln!("[OpenFile] Failed to overwrite local file: {}", e);
+                            log::error!("Failed to overwrite local file: {}", e);
                         }
                     }
                 }
                 _ => {
-                    println!("[OpenFile] Local file is newer or same age, using local");
+                    log::info!("Local file is newer or same age, using local");
                 }
             }
         }
@@ -1557,7 +1560,7 @@ unsafe fn show_open_file_dialog() {
         cmd.env("NOTES_REFRESH_TOKEN", token);
     }
     match cmd.spawn() {
-        Ok(_) => println!("[OpenFile] Spawned new window for {:?}", new_path),
-        Err(e) => eprintln!("[OpenFile] Failed to spawn new window: {}", e),
+        Ok(_) => log::info!("Spawned new window for {:?}", new_path),
+        Err(e) => log::error!("Failed to spawn new window: {}", e),
     }
 }
