@@ -398,9 +398,10 @@ fn auto_save_all_windows(mtm: MainThreadMarker) {
                     log::error!("Auto-save: Azure upload failed: {:?}", e);
                     // Fallback: try to refresh the SAS URL
                     if let Some(app_del) = get_app_delegate(mtm) {
-                        if let Some(ref token) = *app_del.ivars().refresh_token.lock().unwrap() {
+                        let saved_token = app_del.ivars().refresh_token.lock().unwrap().clone();
+                        if let Some(token) = saved_token {
                             log::info!("Auto-save: Attempting to refresh SAS URL...");
-                            match call_get_url(token) {
+                            match call_get_url(&token) {
                                 Ok((new_token, new_url)) => {
                                     *app_del.ivars().refresh_token.lock().unwrap() = Some(new_token.clone());
                                     *app_del.ivars().container_sas_url.lock().unwrap() = Some(new_url.clone());
@@ -431,6 +432,9 @@ fn auto_save_all_windows(mtm: MainThreadMarker) {
 // These functions use a container SAS URL for authentication.
 
 const AUTH_BASE_URL: &str = "https://notes-auth-func.azurewebsites.net/api";
+
+/// Set to `false` to log Azure errors on a single line instead of multi-line.
+const MULTILINE_AZURE_ERRORS: bool = true;
 
 const KEYCHAIN_SERVICE: &str = "com.notes.app";
 const KEYCHAIN_ACCOUNT: &str = "refresh_token";
@@ -473,6 +477,42 @@ fn delete_token_from_keychain() {
     }
 }
 
+/// Parse Azure Storage XML error responses into a human-readable message.
+/// When `MULTILINE_AZURE_ERRORS` is true, formats on separate lines;
+fn parse_azure_error(status: reqwest::StatusCode, raw: &str) -> String {
+    fn extract_tag(xml: &str, tag: &str) -> Option<String> {
+        let open = format!("<{}>", tag);
+        let close = format!("</{}>", tag);
+        let start = xml.find(&open)? + open.len();
+        let end = xml[start..].find(&close)? + start;
+        Some(xml[start..end].to_string())
+    }
+
+    let code = extract_tag(raw, "Code");
+    let message = extract_tag(raw, "Message");
+    let detail = extract_tag(raw, "AuthenticationErrorDetail");
+
+    if code.is_none() {
+        return format!("{}: {}", status, raw);
+    }
+
+    let mut parts = vec![format!("Code: {}", code.unwrap())];
+    if let Some(m) = message {
+        if let Some(first_line) = m.lines().next() {
+            parts.push(format!("Message: {}", first_line));
+        }
+    }
+    if let Some(d) = detail {
+        parts.push(format!("Detail: {}", d));
+    }
+
+    if MULTILINE_AZURE_ERRORS {
+        format!("{}\n  {}", status, parts.join("\n  "))
+    } else {
+        format!("{} — {}", status, parts.join("; "))
+    }
+}
+
 /// Builds the full blob URL from the container SAS URL and a blob name
 fn build_blob_url(container_sas_url: &str, blob_name: &str) -> String {
     if let Some(query_start) = container_sas_url.find('?') {
@@ -511,7 +551,7 @@ fn azure_download(container_sas_url: &str, blob_name: &str) -> Result<Vec<u8>, B
         if !response.status().is_success() {
             let status = response.status();
             let body = response.text().await.unwrap_or_default();
-            return Err(format!("Azure blob fetch failed ({}): {}", status, body).into());
+            return Err(format!("Azure blob fetch failed: {}", parse_azure_error(status, &body)).into());
         }
 
         let bytes = response.bytes().await?;
@@ -538,7 +578,7 @@ fn azure_upload(container_sas_url: &str, blob_name: &str, body: Vec<u8>) -> Resu
         if !response.status().is_success() {
             let status = response.status();
             let body = response.text().await.unwrap_or_default();
-            return Err(format!("Azure upload failed ({}): {}", status, body).into());
+            return Err(format!("Azure upload failed: {}", parse_azure_error(status, &body)).into());
         }
 
         log::info!("[Azure Upload] Upload successful");
@@ -586,7 +626,7 @@ fn azure_list_keys(container_sas_url: &str) -> Result<Vec<String>, Box<dyn std::
         if !response.status().is_success() {
             let status = response.status();
             let body = response.text().await.unwrap_or_default();
-            return Err(format!("Azure list blobs failed ({}): {}", status, body).into());
+            return Err(format!("Azure list blobs failed: {}", parse_azure_error(status, &body)).into());
         }
 
         let body = response.text().await?;
@@ -1740,8 +1780,9 @@ define_class!(
                 Err(e) => {
                     log::error!("Failed to list Azure blobs: {:?}", e);
                     // Fallback: try to refresh SAS URL
-                    if let Some(ref token) = *self.ivars().refresh_token.lock().unwrap() {
-                        match call_get_url(token) {
+                    let saved_token = self.ivars().refresh_token.lock().unwrap().clone();
+                    if let Some(token) = saved_token {
+                        match call_get_url(&token) {
                             Ok((new_token, new_url)) => {
                                 *self.ivars().refresh_token.lock().unwrap() = Some(new_token);
                                 *self.ivars().container_sas_url.lock().unwrap() = Some(new_url.clone());

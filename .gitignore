@@ -3,3 +3,4 @@ local/windows/target/
 local/shared/target/
 .DS_Store
 **/Cargo.lock
+local/macos/Notes.app/
